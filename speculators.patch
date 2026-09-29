@@ -1,0 +1,3326 @@
+diff --git a/scripts/launch_vllm_nkv.py b/scripts/launch_vllm_nkv.py
+new file mode 100644
+index 0000000..8639020
+--- /dev/null
++++ b/scripts/launch_vllm_nkv.py
+@@ -0,0 +1,204 @@
++
++import argparse
++import json
++import os
++import sys
++import warnings
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description="Launch vLLM for hidden states extraction",
++        usage=(
++            "launch_vllm_nkv.py [-h] MODEL [--hidden-states-path HIDDEN_STATES_PATH] "
++            "[--target-layer-ids ... | --attn-kv-layer-ids ... | --layer-mapping JSON] "
++            "-- *VLLM_ARGS"
++        ),
++    )
++    parser.add_argument(
++        "model", type=str, help="Model name or path to extract hidden states from"
++    )
++    parser.add_argument(
++        "--hidden-states-path",
++        type=str,
++        default="/tmp/hidden_states",  # noqa: S108
++        help="The directory to save hidden states to. Default '/tmp/hidden_states'.",
++    )
++    parser.add_argument(
++        "--target-layer-ids",
++        type=int,
++        nargs="+",
++        help=(
++            "A (space separated) list of integer layer ids whose KV is extracted. "
++            "Exactly one of --target-layer-ids / --attn-kv-layer-ids / --layer-mapping "
++            "is required. If set, pass the same value into the training process."
++        ),
++    )
++    parser.add_argument(
++        "--attn-kv-layer-ids",
++        type=int,
++        nargs="+",
++        default=None,
++        help=(
++            "(mamba_attn_hybrid) Verifier KV layer ids the hybrid's attention blocks "
++            "read; the data's KV set is sorted(set(...)). Mutually exclusive with "
++            "--target-layer-ids / --layer-mapping. Pass the same ids to "
++            "scripts/train.py --attn-kv-layer-ids."
++        ),
++    )
++    parser.add_argument(
++        "--layer-mapping",
++        type=str,
++        default=None,
++        help=(
++            "JSON list-of-lists mapping draft layers to verifier layers. "
++            "e.g. '[[1,2],[9,10],[17,18],[25,26],[33,34]]'. "
++            "Single-element groups use KV as-is, multi-element groups average. "
++            "Mutually exclusive with --target-layer-ids."
++        ),
++    )
++    parser.add_argument(
++        "--include-last-layer",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help=(
++            "Append the last layer (num_hidden_layers) to "
++            "target_layer_ids for verifier hidden states extraction. Default: True"
++        ),
++    )
++    parser.add_argument(
++        "--latent-fusion-layer-ids",
++        type=int,
++        nargs="+",
++        default=None,
++        help=(
++            "(mamba_attn_hybrid: REQUIRED) Verifier layer ids whose "
++            "hidden states are saved "
++            "as the SSM latent-fusion seed (vLLM stores them in ascending layer-index "
++            "order, before the final layer). If unset, only the final layer is saved "
++            "(the default) and a mamba_attn_hybrid training run fails at the first "
++            "forward with an fc width mismatch. Pass the SAME ids you pass to "
++            "scripts/train.py --latent-fusion-layer-ids (which defaults to "
++            "--target-layer-ids when unset)."
++        ),
++    )
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Print the command that would be executed without running it",
++    )
++    return parser.parse_known_args()
++
++
++def main():
++    args, vllm_args = parse_args()
++    if "--" in vllm_args:
++        vllm_args.remove("--")
++
++    if not any("enable-prefix-caching" in a or "enable_prefix_caching" in a for a in vllm_args):
++        vllm_args.append("--no-enable-prefix-caching")
++    if not any("enable-chunked-prefill" in a or "enable_chunked_prefill" in a for a in vllm_args):
++        vllm_args.append("--no-enable-chunked-prefill")
++
++    from transformers import AutoConfig  # noqa: PLC0415
++
++    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
++    if hasattr(config, "text_config"):
++        config = config.text_config
++    num_hidden_layers = config.num_hidden_layers
++
++    layer_mapping = None
++    if args.layer_mapping is not None:
++        layer_mapping = json.loads(args.layer_mapping)
++        if not isinstance(layer_mapping, list) or not all(
++            isinstance(g, list) and all(isinstance(x, int) for x in g)
++            for g in layer_mapping
++        ):
++            raise ValueError("--layer-mapping must be a JSON list of lists of ints")
++
++    n_kv_sources = sum(
++        x is not None
++        for x in (args.target_layer_ids, args.attn_kv_layer_ids, layer_mapping)
++    )
++    if n_kv_sources != 1:
++        raise ValueError(
++            "Exactly one of --target-layer-ids, --attn-kv-layer-ids, or "
++            "--layer-mapping must be provided"
++        )
++
++    if layer_mapping is not None:
++        target_layer_ids = sorted({lid for group in layer_mapping for lid in group})
++    elif args.attn_kv_layer_ids is not None:
++        target_layer_ids = sorted(set(args.attn_kv_layer_ids))
++        warnings.warn(
++            f"Extracting KV for attn-kv layers {target_layer_ids}. Pass the SAME ids "
++            "into scripts/train.py --attn-kv-layer-ids.",
++            stacklevel=2,
++        )
++    else:
++        target_layer_ids = args.target_layer_ids
++        warnings.warn(
++            f"Using custom target layer ids {target_layer_ids}. These "
++            "must also be explicitly passed into the training script.",
++            stacklevel=2,
++        )
++
++    if args.attn_kv_layer_ids is not None and args.latent_fusion_layer_ids is None:
++        raise ValueError(
++            "--latent-fusion-layer-ids is required with --attn-kv-layer-ids "
++            "(mamba_attn_hybrid uses the fused verifier hidden as the SSM seed). "
++            "Pass the same ids as scripts/train.py --latent-fusion-layer-ids."
++        )
++
++    fusion_ids = list(args.latent_fusion_layer_ids or [])
++    if num_hidden_layers in fusion_ids:
++        raise ValueError(
++            f"--latent-fusion-layer-ids must not include the final layer "
++            f"{num_hidden_layers}; it is appended automatically as the target layer."
++        )
++    hidden_state_layer_ids = list(fusion_ids)
++    if args.include_last_layer:
++        hidden_state_layer_ids.append(num_hidden_layers)
++
++    speculative_config = {
++        "method": "extract_hidden_states",
++        "num_speculative_tokens": 1,
++        "draft_model_config": {
++            "hf_config": {"eagle_aux_hidden_state_layer_ids": hidden_state_layer_ids}
++        },
++    }
++    extra_config = {
++        "shared_storage_path": args.hidden_states_path,
++        "target_layer_ids": target_layer_ids,
++    }
++    if layer_mapping is not None:
++        extra_config["layer_mapping"] = layer_mapping
++    kv_transfer_config = {
++        "kv_connector": "NKVDataConnector",
++        "kv_role": "kv_producer",
++        "kv_connector_module_path": "speculators.data_generation.nkv_connector",
++        "kv_connector_extra_config": extra_config,
++    }
++
++    cmd = [
++        sys.executable,
++        "-m",
++        "vllm.entrypoints.cli.main",
++        "serve",
++        args.model,
++        "--speculative_config",
++        json.dumps(speculative_config),
++        "--kv_transfer_config",
++        json.dumps(kv_transfer_config),
++        *vllm_args,
++    ]
++
++    print("Running command:")
++    print(" ".join(cmd))
++
++    if not args.dry_run:
++        os.execvp(cmd[0], cmd)  # noqa: S606
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/train.py b/scripts/train.py
+index d1bd079..13ce97b 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -27,6 +27,7 @@ from speculators.models.utils import (
+     get_verifier_config,
+     resolve_draft_intermediate_size,
+ )
++from speculators.train.data import create_empty_nkv_mamba_sample
+ from speculators.train.dataloader import create_train_val_loaders
+ from speculators.train.distributed import (
+     get_rank,
+@@ -475,6 +476,36 @@ def build_draft_model(
+             )
+         else:
+             full_attention_indices = args.full_attention_indices
++            if args.speculator_type == "mamba_attn_hybrid":
++                from speculators.models.mamba_attn_hybrid.config import (  # noqa: PLC0415
++                    parse_block_pattern,
++                )
++
++                n_attn = parse_block_pattern(args.block_pattern).count("attention")
++                if args.num_layers != n_attn:
++                    logger.info(
++                        "mamba_attn_hybrid: setting --num-layers to the %d attention "
++                        "sub-layers in --block-pattern (was %d).",
++                        n_attn,
++                        args.num_layers,
++                    )
++                    args.num_layers = n_attn
++                if args.sliding_window_indices is not None:
++                    bad = [
++                        i
++                        for i in args.sliding_window_indices
++                        if not 0 <= i < args.num_layers
++                    ]
++                    if bad:
++                        raise ValueError(
++                            f"--sliding-window-indices {bad} out of range for "
++                            f"{args.num_layers} attention sub-layers."
++                        )
++                    full_attention_indices = [
++                        i
++                        for i in range(args.num_layers)
++                        if i not in set(args.sliding_window_indices)
++                    ]
+             if not full_attention_indices:
+                 logger.info(
+                     "All %d draft layers using sliding window attention "
+@@ -612,6 +643,27 @@ def main(args: argparse.Namespace):  # noqa: C901
+     }
+     preprocess = preprocess_fns.get(args.speculator_type)
+ 
++    data_format = "hidden_states"
++    noise_tensors: tuple[str, ...] = ("hidden_states",)
++    empty_sample_factory = None
++    if args.speculator_type == "mamba_attn_hybrid":
++        data_format = "nkv_mamba"
++        noise_tensors = ("kv_caches",)
++        tl_config = draft_model.config.transformer_layer_config
++        num_kv_layers = len(draft_model.target_layer_ids)
++        num_fusion_layers = len(draft_model.config.latent_fusion_layer_ids)
++        head_dim = getattr(tl_config, "head_dim", None) or (
++            tl_config.hidden_size // tl_config.num_attention_heads
++        )
++        empty_sample_factory = lambda: create_empty_nkv_mamba_sample(  # noqa: E731
++            hidden_size=tl_config.hidden_size,
++            num_fusion_layers=num_fusion_layers,
++            num_target_layers=num_kv_layers,
++            num_kv_heads=tl_config.num_key_value_heads,
++            head_dim=head_dim,
++            dtype=hidden_states_dtype,
++        )
++
+     train_loader, val_loader = create_train_val_loaders(
+         data_path=args.data_path,
+         train_data_ratio=args.train_data_ratio,
+@@ -631,6 +683,9 @@ def main(args: argparse.Namespace):  # noqa: C901
+         num_workers=args.num_workers,
+         prefetch_factor=args.prefetch_factor,
+         preprocess=preprocess,
++        data_format=data_format,
++        noise_tensors=noise_tensors,
++        empty_sample_factory=empty_sample_factory,
+     )
+ 
+     # Get trainer kwargs from model class
+@@ -1097,6 +1152,107 @@ def parse_args():
+         help="Smoothing constant for D-PACE loss (default: 0.5)",
+     )
+     # DSpark-specific arguments (sequential Markov head + confidence head).
++    parser.add_argument(
++        "--block-pattern",
++        type=str,
++        nargs="+",
++        default=["mamba", "attention", "mlp"] * 5,
++        help="mamba_attn_hybrid recipe: a flat sequence of {mamba, attention, mlp} "
++        "sub-layers, space-separated like the other layer flags, e.g. "
++        "--block-pattern mamba mlp mamba attention mlp. Each mlp marks the end of one "
++        "layer; must contain >=1 mamba and >=1 attention and end with mlp.",
++    )
++    parser.add_argument(
++        "--attn-kv-layer-ids",
++        type=int,
++        nargs="+",
++        default=None,
++        help="mamba_attn_hybrid: the SOLE verifier-KV source -- the verifier KV layer "
++        "each attention sub-layer reads, in attention-block order (repeats / any order "
++        "allowed). REQUIRED for the hybrid; the data's KV set is sorted(set(...)). Length "
++        "must equal the number of 'attention' tokens in --block-pattern. Pass the same "
++        "ids to launch_vllm_nkv.py --attn-kv-layer-ids.",
++    )
++    parser.add_argument(
++        "--latent-fusion-layer-ids",
++        type=int,
++        nargs="+",
++        default=None,
++        help="Verifier hidden-state layer ids fused into the SSM seed latent. "
++        "Defaults to sorted(set(--attn-kv-layer-ids)) when unset.",
++    )
++    parser.add_argument(
++        "--mamba-seed-mode",
++        type=str,
++        default="per_layer",
++        choices=["per_layer", "shared", "once"],
++        help="How the verifier latent z seeds the SSM across mamba sub-layers: "
++        "'per_layer' = a distinct seed proj per sub-layer (default, heaviest); "
++        "'shared' = one shared proj reused everywhere; 'once' = seed only the first "
++        "mamba (later ones start from a zero SSM state).",
++    )
++    parser.add_argument(
++        "--mamba-d-state",
++        type=int,
++        default=16,
++        help="SSM latent state size (d_state) of the Mamba-2 mixer (default: 16).",
++    )
++    parser.add_argument(
++        "--mamba-num-heads",
++        type=int,
++        default=64,
++        help="Number of SSD heads of the Mamba-2 mixer (default: 64).",
++    )
++    parser.add_argument(
++        "--mamba-head-dim",
++        type=int,
++        default=64,
++        help="SSD head dimension of the Mamba-2 mixer (default: 64).",
++    )
++    parser.add_argument(
++        "--mamba-n-groups",
++        type=int,
++        default=1,
++        help="Number of B/C groups of the Mamba-2 mixer (default: 1).",
++    )
++    parser.add_argument(
++        "--sliding-window-indices",
++        type=int,
++        nargs="+",
++        default=None,
++        help="mamba_attn_hybrid: attention sub-layer indices that use sliding-window "
++        "attention (window = --sliding-window); every other attention sub-layer is "
++        "full attention. Unset leaves the --full-attention-indices convention in "
++        "charge (all sub-layers windowed unless listed there).",
++    )
++    parser.add_argument(
++        "--trainable-q-proj",
++        action="store_true",
++        default=False,
++        help="Allow draft q_proj to train. Default: frozen.",
++    )
++    parser.add_argument(
++        "--trainable-kv-proj",
++        action="store_true",
++        default=False,
++        help="Allow draft k_proj/v_proj to train. Default: frozen.",
++    )
++    parser.add_argument(
++        "--use-qk-norm",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Apply per-head RMSNorm (q_norm/k_norm) in the hybrid draft attention; "
++        "--no-use-qk-norm disables it (Identity). Explicit choice, no verifier "
++        "auto-detection. mamba_attn_hybrid only.",
++    )
++    parser.add_argument(
++        "--parallel-drafting-loss-weight",
++        choices=["dflash", "dpace"],
++        default="dflash",
++        help="mamba_attn_hybrid: per-position weighting of the block-drafting loss: "
++        "'dflash' = fixed exponential position decay (default); 'dpace' = adaptive "
++        "Dynamic Position-Aware Cross-Entropy weights. Same loss reduction either way.",
++    )
+     parser.add_argument(
+         "--markov-rank",
+         type=int,
+diff --git a/src/speculators/data_generation/nkv_connector.py b/src/speculators/data_generation/nkv_connector.py
+new file mode 100644
+index 0000000..7bcc091
+--- /dev/null
++++ b/src/speculators/data_generation/nkv_connector.py
+@@ -0,0 +1,431 @@
++
++import os
++from collections import defaultdict
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Any
++
++import safetensors
++import torch
++
++from vllm.config import VllmConfig, get_layers_from_vllm_config
++from vllm.forward_context import get_forward_context
++from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++    KVConnectorBase_V1,
++    KVConnectorMetadata,
++    KVConnectorRole,
++    SupportsHMA,
++)
++from vllm.logger import init_logger
++from vllm.v1.attention.backend import AttentionMetadata
++from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
++
++if TYPE_CHECKING:
++    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++    from vllm.v1.kv_cache_interface import KVCacheConfig
++    from vllm.v1.request import Request
++
++logger = init_logger(__name__)
++
++
++def parse_attn_layer_id(layer_name: str) -> int | None:
++    if "model.layers." not in layer_name or ".self_attn" not in layer_name:
++        return None
++    part = layer_name.split("model.layers.")[1].split(".")[0]
++    if not part.isnumeric():
++        return None
++    return int(part)
++
++
++def _get_tp_info() -> tuple[int, int]:
++    try:
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_rank,
++            get_tensor_model_parallel_world_size,
++        )
++
++        tp_size = get_tensor_model_parallel_world_size()
++        tp_rank = get_tensor_model_parallel_rank()
++    except (ImportError, AssertionError, RuntimeError):
++        tp_size, tp_rank = 1, 0
++    return tp_size, tp_rank
++
++
++def extract_from_kv_cache(
++    kv_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    num_tokens: int,
++) -> torch.Tensor:
++    block_size = kv_cache.shape[-3]
++    if kv_cache.dim() == 4:
++        return kv_cache[
++            slot_mapping // block_size, slot_mapping % block_size
++        ][:num_tokens]
++    if kv_cache.shape[0] == 2:
++        return kv_cache[
++            :, slot_mapping // block_size, slot_mapping % block_size
++        ][:, :num_tokens]
++    return kv_cache[
++        slot_mapping // block_size, :, slot_mapping % block_size
++    ].transpose(0, 1)[:, :num_tokens]
++
++
++def resolve_layer_slot_mapping(
++    layer_name: str, attn_metadata: "AttentionMetadata"
++) -> torch.Tensor:
++    try:
++        sm = get_forward_context().slot_mapping
++        if isinstance(sm, dict):
++            per_layer = sm.get(layer_name)
++            if per_layer is not None:
++                return per_layer
++    except Exception:  # noqa: BLE001 - any context miss falls back below
++        pass
++    return attn_metadata.slot_mapping
++
++
++@dataclass
++class ReqMeta:
++    req_id: str
++    filename: str
++    token_ids: torch.Tensor
++    new_req: bool
++
++    @staticmethod
++    def make_meta(
++        req_id: str,
++        filename: str,
++        token_ids: list[int],
++        new_req: bool,
++    ) -> "ReqMeta":
++        return ReqMeta(
++            req_id=req_id,
++            filename=filename,
++            token_ids=torch.tensor(token_ids),
++            new_req=new_req,
++        )
++
++
++@dataclass
++class NKVConnectorMetadata(KVConnectorMetadata):
++    requests: list[ReqMeta] = field(default_factory=list)
++
++    def add_request(
++        self,
++        req_id: str,
++        filename: str,
++        token_ids: list[int],
++        new_req: bool = True,
++    ) -> None:
++        self.requests.append(
++            ReqMeta.make_meta(req_id, filename, token_ids, new_req)
++        )
++
++
++class NKVDataConnector(KVConnectorBase_V1, SupportsHMA):
++
++    @property
++    def prefer_cross_layer_blocks(self) -> bool:
++        return False
++
++    def __init__(
++        self,
++        vllm_config: "VllmConfig",
++        role: KVConnectorRole,
++        kv_cache_config: "KVCacheConfig",
++    ):
++        super().__init__(
++            vllm_config=vllm_config,
++            role=role,
++            kv_cache_config=kv_cache_config,
++        )
++        self._block_size = vllm_config.cache_config.block_size
++        self._storage_path = self._kv_transfer_config.get_from_extra_config(
++            "shared_storage_path", "/tmp"
++        )
++        self.cache_layers: list[str] = []
++        logger.info(self._kv_transfer_config)
++        logger.info("Shared storage path is %s", self._storage_path)
++
++        assert self._vllm_config.speculative_config is not None, (
++            "NKVDataConnector only works when using "
++            "'extract_hidden_states' speculative method"
++        )
++        spec_config = self._vllm_config.speculative_config.draft_model_config.hf_config
++        self.num_hidden_states = len(
++            getattr(spec_config, "eagle_aux_hidden_state_layer_ids", [])
++        )
++
++        self._request_filenames: dict[str, str] = {}
++        self._active_requests: dict[str, NewRequestData] = {}
++        self._req_blocks: dict[str, list[int]] = {}
++
++        self._layer_mapping: list[list[int]] | None = (
++            self._kv_transfer_config.get_from_extra_config(
++                "layer_mapping", None
++            )
++        )
++
++        if self._layer_mapping is not None:
++            self._target_layer_ids = sorted(
++                {lid for group in self._layer_mapping for lid in group}
++            )
++        else:
++            self._target_layer_ids: list[int] = (
++                self._kv_transfer_config.get_from_extra_config(
++                    "target_layer_ids", []
++                )
++            )
++
++        self._target_attn_layers: dict[int, str] = {}
++        self._kv_buffers: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
++
++        logger.info("NKV target layer IDs: %s", self._target_layer_ids)
++        if self._layer_mapping is not None:
++            logger.info("NKV layer mapping: %s", self._layer_mapping)
++
++        _tp = getattr(self._vllm_config.parallel_config, "tensor_parallel_size", 1)
++        if _tp > 1:
++            _mc = self._vllm_config.model_config
++            _hf = getattr(_mc, "hf_text_config", None) or _mc.hf_config
++            _kv_counts = [
++                h
++                for h in (
++                    getattr(_hf, "num_key_value_heads", None),
++                    getattr(_hf, "num_global_key_value_heads", None),
++                )
++                if h is not None
++            ]
++            if _kv_counts and min(_kv_counts) < _tp:
++                raise NotImplementedError(
++                    f"NKV TP head-gather does not support the KV-head-replication regime "
++                    f"(min num_kv_heads {min(_kv_counts)} < tensor_parallel_size {_tp}): vLLM "
++                    f"replicates KV heads there, so the gather would duplicate them and save a "
++                    f"wrong head count. Serve data-gen with tensor_parallel_size <= num_kv_heads."
++                )
++
++    def start_load_kv(self, *args, **kwargs: Any) -> None:
++        pass
++
++    def wait_for_layer_load(self, layer_name: str) -> None:
++        pass
++
++    def wait_for_save(self):
++        pass
++
++    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
++        from vllm.model_executor.models.extract_hidden_states import (
++            CacheOnlyAttentionLayer,
++        )
++
++        layers = get_layers_from_vllm_config(
++            self._vllm_config, CacheOnlyAttentionLayer, list(kv_caches.keys())
++        )
++        self.cache_layers = list(layers.keys())
++        assert len(self.cache_layers) == 1, (
++            f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
++        )
++
++        for layer_name in kv_caches:
++            layer_id = parse_attn_layer_id(layer_name)
++            if layer_id is not None and layer_id in self._target_layer_ids:
++                self._target_attn_layers[layer_id] = layer_name
++
++        logger.info(
++            "NKV registered %d target attention layers: %s",
++            len(self._target_attn_layers),
++            self._target_attn_layers,
++        )
++        missing = set(self._target_layer_ids) - set(self._target_attn_layers.keys())
++        if missing:
++            logger.warning(
++                "NKV: requested layer IDs %s not found in model", missing
++            )
++
++    def save_kv_layer(
++        self,
++        layer_name: str,
++        kv_layer: torch.Tensor,
++        attn_metadata: AttentionMetadata,
++        **kwargs: Any,
++    ) -> None:
++        if layer_name in self._target_attn_layers.values():
++            self._buffer_kv_layer(layer_name, kv_layer, attn_metadata)
++            return
++
++        if layer_name not in self.cache_layers:
++            return
++
++
++        from vllm.model_executor.models.extract_hidden_states import (
++            CacheOnlyAttentionMetadata,
++        )
++
++        assert isinstance(attn_metadata, CacheOnlyAttentionMetadata), (
++            "NKVDataConnector only supports CacheOnlyAttentionBackend"
++        )
++
++        connector_metadata = self._get_connector_metadata()
++        assert isinstance(connector_metadata, NKVConnectorMetadata)
++
++        os.makedirs(self._storage_path, exist_ok=True)
++
++        _, tp_rank = _get_tp_info()
++
++        slot_mapping = resolve_layer_slot_mapping(layer_name, attn_metadata)
++        offset = 0
++        for request in connector_metadata.requests:
++            num_tokens = request.token_ids.shape[0]
++
++            kv_buffer = self._kv_buffers.pop(request.req_id, {})
++
++            if tp_rank != 0:
++                offset += num_tokens
++                continue
++
++            req_slot_mapping = slot_mapping[offset : offset + num_tokens]
++            offset += num_tokens
++
++            hidden_states = extract_from_kv_cache(
++                kv_layer, req_slot_mapping, num_tokens
++            )
++            tensors: dict[str, torch.Tensor] = {
++                "hidden_states": hidden_states.detach().cpu(),
++                "token_ids": request.token_ids.detach().cpu(),
++            }
++
++            if kv_buffer:
++                tensors["kv_caches"] = torch.stack(
++                    [kv_buffer[lid] for lid in self._target_layer_ids]
++                )
++
++            safetensors.torch.save_file(tensors, request.filename)
++
++    def _buffer_kv_layer(
++        self,
++        layer_name: str,
++        kv_layer: torch.Tensor,
++        attn_metadata: AttentionMetadata,
++    ) -> None:
++        layer_id = None
++        for lid, lname in self._target_attn_layers.items():
++            if lname == layer_name:
++                layer_id = lid
++                break
++        assert layer_id is not None
++
++        connector_metadata = self._get_connector_metadata()
++        assert isinstance(connector_metadata, NKVConnectorMetadata)
++
++        tp_size, _ = _get_tp_info()
++
++        slot_mapping = resolve_layer_slot_mapping(layer_name, attn_metadata)
++        offset = 0
++        for request in connector_metadata.requests:
++            num_tokens = request.token_ids.shape[0]
++            req_slot_mapping = slot_mapping[offset : offset + num_tokens]
++            offset += num_tokens
++
++            kv_data = extract_from_kv_cache(
++                kv_layer, req_slot_mapping, num_tokens
++            )
++            if tp_size > 1:
++                from vllm.distributed.parallel_state import get_tp_group
++
++                kv_data = get_tp_group().all_gather(kv_data.contiguous(), dim=2)
++            self._kv_buffers[request.req_id][layer_id] = kv_data.detach().cpu()
++
++
++    def get_num_new_matched_tokens(
++        self,
++        request: "Request",
++        num_computed_tokens: int,
++    ) -> tuple[int | None, bool]:
++        return 0, False
++
++    def update_state_after_alloc(
++        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
++    ):
++        assert num_external_tokens == 0, "This connector is store-only"
++
++    def build_connector_meta(
++        self,
++        scheduler_output: SchedulerOutput,
++    ) -> KVConnectorMetadata:
++        meta = NKVConnectorMetadata()
++        for new_req in scheduler_output.scheduled_new_reqs:
++            token_ids = new_req.prompt_token_ids or []
++            n_sched = getattr(scheduler_output, "num_scheduled_tokens", {}).get(
++                new_req.req_id
++            )
++            if n_sched is not None and n_sched < len(token_ids):
++                raise RuntimeError(
++                    f"NKVDataConnector: request {new_req.req_id} scheduled {n_sched} < "
++                    f"prompt {len(token_ids)} tokens (prefix-cache hit or chunked "
++                    f"prefill) — saved rows would be position-shifted. Launch data-gen "
++                    f"with --no-enable-prefix-caching and --no-enable-chunked-prefill."
++                )
++            filename = os.path.join(self._storage_path, f"{new_req.req_id}.safetensors")
++            meta.add_request(
++                new_req.req_id,
++                filename=filename,
++                token_ids=token_ids,
++            )
++            self._request_filenames[new_req.req_id] = filename
++            self._active_requests[new_req.req_id] = new_req
++            self._req_blocks[new_req.req_id] = list(new_req.block_ids[0])
++
++        cached_reqs = scheduler_output.scheduled_cached_reqs
++        for i, req_id in enumerate(cached_reqs.req_ids):
++            if req_id not in self._active_requests:
++                continue
++
++            new_block_ids = cached_reqs.new_block_ids[i]
++
++            cached_req = self._active_requests[req_id]
++            req_block_ids = self._req_blocks[req_id]
++
++            if new_block_ids is None:
++                continue
++
++            block_ids = new_block_ids[0]
++
++            req_block_ids.extend(block_ids)
++            filename = os.path.join(self._storage_path, f"{req_id}.safetensors")
++
++            meta.add_request(
++                req_id=req_id,
++                filename=filename,
++                token_ids=cached_req.prompt_token_ids or [],
++                new_req=False,
++            )
++
++        return meta
++
++    def request_finished(
++        self,
++        request: "Request",
++        block_ids: list[int],
++    ) -> tuple[bool, dict[str, Any] | None]:
++        req_id = request.request_id
++        req_filename = self._request_filenames.pop(req_id, None)
++        _ = self._active_requests.pop(req_id, None)
++        _ = self._req_blocks.pop(req_id, None)
++        _ = self._kv_buffers.pop(req_id, None)
++
++        return False, {"hidden_states_path": req_filename}
++
++    def request_finished_all_groups(
++        self,
++        request: "Request",
++        block_ids: tuple[list[int], ...],
++    ) -> tuple[bool, dict[str, Any] | None]:
++        return self.request_finished(request, block_ids[0])
++
++    @classmethod
++    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
++        if cls is KVConnectorBase_V1:
++            raise TypeError(
++                "get_required_kvcache_layout should not be called "
++                "on the abstract base class"
++            )
++        return "NHD"
+diff --git a/src/speculators/models/__init__.py b/src/speculators/models/__init__.py
+index d7b0efa..b316083 100644
+--- a/src/speculators/models/__init__.py
++++ b/src/speculators/models/__init__.py
+@@ -3,6 +3,10 @@ from speculators.models.attention import ALL_ATTENTION_FUNCTIONS  # noqa: F401
+ from .dflash import DFlashDraftModel, DFlashSpeculatorConfig
+ from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
+ from .eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
++from .mamba_attn_hybrid import (
++    MambaAttnHybridDraftModel,
++    MambaAttnHybridSpeculatorConfig,
++)
+ from .mtp import MTPDraftModel, MTPSpeculatorConfig
+ from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
+ 
+@@ -13,6 +17,8 @@ __all__ = [
+     "DSparkSpeculatorConfig",
+     "Eagle3DraftModel",
+     "Eagle3SpeculatorConfig",
++    "MambaAttnHybridDraftModel",
++    "MambaAttnHybridSpeculatorConfig",
+     "MTPDraftModel",
+     "MTPSpeculatorConfig",
+     "PEagleDraftModel",
+diff --git a/src/speculators/models/mamba_attn_hybrid/__init__.py b/src/speculators/models/mamba_attn_hybrid/__init__.py
+new file mode 100644
+index 0000000..4e55149
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/__init__.py
+@@ -0,0 +1,11 @@
++from speculators.models.mamba_attn_hybrid.config import (
++    MambaAttnHybridSpeculatorConfig,
++    parse_block_pattern,
++)
++from speculators.models.mamba_attn_hybrid.core import MambaAttnHybridDraftModel
++
++__all__ = [
++    "MambaAttnHybridDraftModel",
++    "MambaAttnHybridSpeculatorConfig",
++    "parse_block_pattern",
++]
+diff --git a/src/speculators/models/mamba_attn_hybrid/attention.py b/src/speculators/models/mamba_attn_hybrid/attention.py
+new file mode 100644
+index 0000000..4f2f16a
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/attention.py
+@@ -0,0 +1,108 @@
++import torch
++from torch.nn.attention.flex_attention import (
++    or_masks,
++)
++
++
++def create_anchor_block_mask_mod(
++    document_ids: torch.Tensor,
++    total_seq_len: int,
++    anchor_positions: torch.Tensor,
++    block_size: int,
++    sliding_window: int | None = None,
++    sliding_window_non_causal: bool = False,
++    sliding_window_prefix: int = 0,
++):
++    non_causal = sliding_window is None or sliding_window_non_causal
++
++    device = document_ids.device
++    anchor_positions = anchor_positions.to(device=device, dtype=torch.long).contiguous()
++
++    if anchor_positions.ndim != 1:
++        raise ValueError(
++            f"anchor_positions must be 1D, got shape {tuple(anchor_positions.shape)}"
++        )
++
++    n_anchors = anchor_positions.numel()
++    q_len = n_anchors * block_size
++    kv_len = total_seq_len + q_len
++
++    document_ids = document_ids.to(device=device, dtype=torch.long).contiguous()
++    if document_ids.numel() != total_seq_len:
++        raise ValueError(
++            f"document_ids has {document_ids.numel()} entries, expected "
++            f"total_seq_len={total_seq_len}"
++        )
++
++    doc_starts = None
++    if sliding_window_prefix > 0:
++        raise NotImplementedError(
++            "sliding_window_prefix > 0 is not supported by this mask builder"
++        )
++
++    if (oob := (anchor_positions < 0) | (anchor_positions >= total_seq_len)).any():
++        raise ValueError(
++            f"anchor_positions out of range: {anchor_positions[oob].tolist()}"
++        )
++
++    query_anchor_positions = torch.repeat_interleave(anchor_positions, block_size)
++
++    def base_prefix_mod(_b, _h, q_idx, kv_idx):
++        q_anchor = query_anchor_positions[q_idx]
++        q_doc = document_ids[q_anchor]
++
++        kv_is_base = kv_idx < total_seq_len
++        kv_base_pos = torch.remainder(kv_idx, total_seq_len)
++        kv_doc = document_ids[kv_base_pos]
++
++        same_doc = (q_doc == kv_doc) & (q_doc != -1)
++        before_anchor = kv_base_pos < q_anchor
++
++        in_window = (
++            (kv_base_pos >= q_anchor - sliding_window)
++            if sliding_window is not None
++            else True
++        )
++
++        if doc_starts is not None:
++            in_prefix = (kv_base_pos - doc_starts[kv_base_pos]) < sliding_window_prefix
++            in_window = in_prefix | in_window
++
++        return kv_is_base & same_doc & before_anchor & in_window
++
++    def same_block_mod(_b, _h, q_idx, kv_idx):
++        q_block = q_idx // block_size
++        kv_is_block = kv_idx >= total_seq_len
++        kv_block = (kv_idx - total_seq_len) // block_size
++
++        same = kv_is_block & (q_block == kv_block)
++        if not non_causal:
++            same = same & (kv_idx <= q_idx + total_seq_len)
++        return same
++
++    return or_masks(base_prefix_mod, same_block_mod), q_len, kv_len
++
++
++def create_block_only_mask_mod(
++    anchor_positions: torch.Tensor,
++    block_size: int,
++    sliding_window: int | None = None,
++    sliding_window_non_causal: bool = False,
++):
++    non_causal = sliding_window is None or sliding_window_non_causal
++
++    if anchor_positions.ndim != 1:
++        raise ValueError(
++            f"anchor_positions must be 1D, got shape {tuple(anchor_positions.shape)}"
++        )
++    n_anchors = anchor_positions.numel()
++    q_len = n_anchors * block_size
++    kv_len = q_len
++
++    def same_block_mod(_b, _h, q_idx, kv_idx):
++        same = (q_idx // block_size) == (kv_idx // block_size)
++        if not non_causal:
++            same = same & (kv_idx <= q_idx)
++        return same
++
++    return same_block_mod, q_len, kv_len
+diff --git a/src/speculators/models/mamba_attn_hybrid/attention_layer.py b/src/speculators/models/mamba_attn_hybrid/attention_layer.py
+new file mode 100644
+index 0000000..d94a42b
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/attention_layer.py
+@@ -0,0 +1,160 @@
++from typing import TYPE_CHECKING
++
++import torch
++from torch import nn
++from transformers.cache_utils import Cache
++from transformers.models.qwen3.modeling_qwen3 import (
++    ALL_ATTENTION_FUNCTIONS,
++    FlashAttentionKwargs,
++    Qwen3Config,
++    Qwen3RMSNorm,
++    eager_attention_forward,
++)
++from typing_extensions import Unpack
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++
++
++def _rotate_half(x):
++    x1 = x[..., : x.shape[-1] // 2]
++    x2 = x[..., x.shape[-1] // 2 :]
++    return torch.cat((-x2, x1), dim=-1)
++
++
++def apply_rotary_pos_emb(
++    q,
++    k,
++    cos,
++    sin,
++    position_ids=None,  # noqa: ARG001
++    unsqueeze_dim=1,
++):
++
++    cos = cos.unsqueeze(unsqueeze_dim)
++    sin = sin.unsqueeze(unsqueeze_dim)
++    q_len = q.size(-2)
++    q_embed = (q * cos[..., -q_len:, :]) + (_rotate_half(q) * sin[..., -q_len:, :])
++    k_embed = (k * cos) + (_rotate_half(k) * sin)
++    return q_embed, k_embed
++
++
++def apply_partial_rotary(t, cos, sin):
++    rotary_dim = cos.shape[-1]
++    if rotary_dim == t.shape[-1]:
++        return (t * cos) + (_rotate_half(t) * sin)
++    if rotary_dim > t.shape[-1]:
++        raise ValueError(
++            f"rotary table width ({rotary_dim}) exceeds head_dim ({t.shape[-1]})."
++        )
++    t_rot, t_pass = t[..., :rotary_dim], t[..., rotary_dim:]
++    t_rot = (t_rot * cos) + (_rotate_half(t_rot) * sin)
++    return torch.cat([t_rot, t_pass], dim=-1)
++
++
++class Qwen3DFlashAttention(nn.Module):
++
++    def __init__(self, config: Qwen3Config, layer_idx: int):
++        super().__init__()
++        self.config = config
++        self.layer_idx = layer_idx
++        self.head_dim = getattr(
++            config,
++            "head_dim",
++            config.hidden_size // config.num_attention_heads,  # type: ignore[operator]
++        )
++        self.num_key_value_groups = (
++            config.num_attention_heads // config.num_key_value_heads  # type: ignore[operator]
++        )
++        self.scaling = self.head_dim**-0.5
++        self.attention_dropout = config.attention_dropout
++        self.is_causal = False
++        self.q_proj = nn.Linear(
++            config.hidden_size,  # type: ignore[arg-type]
++            config.num_attention_heads * self.head_dim,  # type: ignore[operator]
++            bias=config.attention_bias,  # type: ignore[arg-type]
++        )
++        self.k_proj = nn.Linear(
++            config.hidden_size,  # type: ignore[arg-type]
++            config.num_key_value_heads * self.head_dim,  # type: ignore[operator]
++            bias=config.attention_bias,  # type: ignore[arg-type]
++        )
++        self.v_proj = nn.Linear(
++            config.hidden_size,  # type: ignore[arg-type]
++            config.num_key_value_heads * self.head_dim,  # type: ignore[operator]
++            bias=config.attention_bias,  # type: ignore[arg-type]
++        )
++        self.o_proj = nn.Linear(
++            config.num_attention_heads * self.head_dim,  # type: ignore[operator]
++            config.hidden_size,  # type: ignore[arg-type]
++            bias=config.attention_bias,  # type: ignore[arg-type]
++        )
++        if getattr(config, "use_qk_norm", True):
++            self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # type: ignore[arg-type]
++            self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # type: ignore[arg-type]
++        else:
++            self.q_norm = nn.Identity()
++            self.k_norm = nn.Identity()
++        self.sliding_window = (
++            config.sliding_window
++            if hasattr(config, "layer_types")
++            and config.layer_types is not None
++            and config.layer_types[layer_idx] == "sliding_attention"  # type: ignore[index]
++            else None
++        )
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        context_kv: tuple[torch.Tensor, torch.Tensor],
++        position_embeddings: tuple[torch.Tensor, torch.Tensor],
++        attention_mask: torch.Tensor | None,
++        past_key_values: Cache | None = None,
++        cache_position: torch.LongTensor | None = None,
++        **kwargs: Unpack[FlashAttentionKwargs],
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        bsz, q_len = hidden_states.shape[:-1]
++        k_ctx, v_ctx = context_kv
++        ctx_len = k_ctx.shape[2]
++        q = self.q_proj(hidden_states)
++        q = q.view(bsz, q_len, -1, self.head_dim)
++        q = self.q_norm(q).transpose(1, 2)
++        k_noise = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
++        k_noise = self.k_norm(k_noise).transpose(1, 2)
++        v_noise = self.v_proj(hidden_states).view(
++            bsz, q_len, -1, self.head_dim
++        ).transpose(1, 2)
++        cos, sin = position_embeddings
++        cos_4d = cos.unsqueeze(1)
++        sin_4d = sin.unsqueeze(1)
++        noise_cos = cos_4d[..., -q_len:, :]
++        noise_sin = sin_4d[..., -q_len:, :]
++        q = apply_partial_rotary(q, noise_cos, noise_sin)
++        k_noise = apply_partial_rotary(k_noise, noise_cos, noise_sin)
++        k = torch.cat([k_ctx, k_noise], dim=2)
++        v = torch.cat([v_ctx, v_noise], dim=2)
++        if past_key_values is not None:
++            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
++            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
++        attn_fn: Callable = eager_attention_forward
++        if (
++            self.config._attn_implementation is not None  # noqa: SLF001
++            and self.config._attn_implementation != "eager"  # noqa: SLF001
++        ):
++            attn_fn = ALL_ATTENTION_FUNCTIONS[
++                self.config._attn_implementation  # noqa: SLF001
++            ]
++        attn_output, attn_weights = attn_fn(
++            self,
++            q,
++            k,
++            v,
++            attention_mask,
++            dropout=0.0 if not self.training else self.attention_dropout,
++            scaling=self.scaling,
++            sliding_window=self.sliding_window,
++            **kwargs,
++        )
++        attn_output = attn_output.reshape(bsz, q_len, -1)
++        attn_output = self.o_proj(attn_output)
++        return attn_output, attn_weights
+diff --git a/src/speculators/models/mamba_attn_hybrid/base_config.py b/src/speculators/models/mamba_attn_hybrid/base_config.py
+new file mode 100644
+index 0000000..49559e5
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/base_config.py
+@@ -0,0 +1,144 @@
++from typing import Any, Literal, Optional
++
++from pydantic import Field, field_serializer, field_validator
++from transformers import AutoConfig, PretrainedConfig
++from transformers.models.qwen3.modeling_qwen3 import (
++    Qwen3Config,
++)
++
++from speculators import SpeculatorModelConfig
++
++__all__ = [
++    "MambaAttnHybridBaseConfig",
++]
++
++
++class MambaAttnHybridBaseConfig(SpeculatorModelConfig):
++
++
++    transformer_layer_config: PretrainedConfig = Field(
++        default_factory=Qwen3Config,
++        description="Configuration for the transformer decoder layer",
++    )
++
++    draft_vocab_size: int = Field(
++        default=32000,
++        description="Size of draft model vocabulary for speculation",
++    )
++
++    block_size: int = Field(
++        default=8,
++        description=(
++            "Default size of the draft block predicted with a forward pass of the model"
++        ),
++    )
++
++    max_anchors: int = Field(
++        default=256,
++        description=(
++            "Maximum number of anchor positions to sample during training "
++            "(controls memory usage and training efficiency)"
++        ),
++    )
++
++
++    aux_hidden_state_layer_ids: list[int] | None = Field(
++        default=None,
++        description="Verifier layer IDs to extract KV caches from (one per draft layer)",
++    )
++
++    mask_token_id: int | None = Field(
++        default=None,
++        description="Token ID used for masking",
++    )
++
++    sliding_window_non_causal: bool = Field(
++        default=False,
++        description="Use non-causal (bidirectional) masking within draft blocks for "
++        "sliding window attention layers. Full attention layers are always "
++        "bidirectional.",
++    )
++
++    sliding_window_prefix: int = Field(
++        default=0,
++        description="Number of attention-sink tokens at the start of each document "
++        "to always attend to in sliding window layers (0 = disabled).",
++    )
++
++    trainable_q_proj: bool = Field(
++        default=False,
++        description="If True, draft q_proj is trainable. If False (default), frozen.",
++    )
++    trainable_kv_proj: bool = Field(
++        default=False,
++        description="If True, draft k_proj/v_proj are trainable. If False (default), frozen.",
++    )
++    trainable_q_norm: bool = Field(
++        default=False,
++        description="If True, draft q_norm is trainable. If False (default), frozen.",
++    )
++    trainable_k_norm: bool = Field(
++        default=False,
++        description="If True, draft k_norm is trainable. If False (default), frozen.",
++    )
++
++    init_q_proj: Literal["verifier", "random"] = Field(
++        default="verifier",
++        description="How to initialize q_proj: 'verifier' copies from target verifier "
++        "layer, 'random' keeps PyTorch default init.",
++    )
++    init_kv_proj: Literal["verifier", "random"] = Field(
++        default="verifier",
++        description="How to initialize k_proj/v_proj: 'verifier' copies from target "
++        "verifier layer, 'random' keeps PyTorch default init.",
++    )
++    init_q_norm: Literal["verifier", "random"] = Field(
++        default="verifier",
++        description="How to initialize q_norm: 'verifier' copies from target verifier "
++        "layer, 'random' keeps PyTorch default init.",
++    )
++    init_k_norm: Literal["verifier", "random"] = Field(
++        default="verifier",
++        description="How to initialize k_norm: 'verifier' copies from target verifier "
++        "layer, 'random' keeps PyTorch default init.",
++    )
++
++    layer_mapping: Optional[list[list[int]]] = Field(
++        default=None,
++        description="Per-draft-layer verifier layer mapping. Each inner list is a group "
++        "of verifier layer IDs: single-element groups use KV as-is, multi-element "
++        "groups are aggregated according to agg_mode.",
++    )
++
++    agg_mode: Literal["avg", "learnedAvg", "headmix"] = Field(
++        default="avg",
++        description="Aggregation mode for multi-element layer_mapping groups. "
++        "'avg' = uniform averaging, 'learnedAvg' = learned softmax weights, "
++        "'headmix' = take disjoint KV head subsets from each verifier layer.",
++    )
++
++    no_mlp_layer_indices: list[int] | None = Field(
++        default=None,
++        description="Draft layer indices that skip the MLP block entirely "
++        "(attention-only layers). None means all layers have MLP.",
++    )
++
++    @field_serializer("transformer_layer_config")
++    def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
++        return value.to_diff_dict()
++
++    @field_validator("transformer_layer_config", mode="before")
++    @classmethod
++    def validate_transformer_config(cls, value: Any) -> PretrainedConfig:
++        if isinstance(value, dict):
++            config_class: type[PretrainedConfig] = Qwen3Config
++            if "model_type" in value:
++                config_class = AutoConfig.for_model(
++                    model_type=value["model_type"]
++                ).__class__
++            return config_class(**value)
++        return value
++
++    @property
++    def target_vocab_size(self) -> int:
++        return self.transformer_layer_config.vocab_size
+diff --git a/src/speculators/models/mamba_attn_hybrid/config.py b/src/speculators/models/mamba_attn_hybrid/config.py
+new file mode 100644
+index 0000000..031833c
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/config.py
+@@ -0,0 +1,178 @@
++from typing import Literal
++
++from pydantic import Field, field_validator, model_validator
++
++from speculators import SpeculatorModelConfig
++from speculators.models.mamba_attn_hybrid.base_config import MambaAttnHybridBaseConfig
++
++__all__ = [
++    "MambaAttnHybridSpeculatorConfig",
++    "parse_block_pattern",
++]
++
++_VALID_BLOCKS = ("mamba", "attention", "mlp")
++
++
++def parse_block_pattern(pattern: "str | list[str]") -> list[str]:
++    raw = pattern if isinstance(pattern, str) else " ".join(str(t) for t in pattern)
++    tokens = [t.lower() for t in raw.split()]
++
++    if not tokens:
++        raise ValueError(
++            "block_pattern is empty; expected tokens from {mamba, attention, mlp}."
++        )
++    bad = [t for t in tokens if t not in _VALID_BLOCKS]
++    if bad:
++        raise ValueError(
++            f"Invalid block_pattern token(s) {bad}; allowed tokens are {list(_VALID_BLOCKS)}."
++        )
++    if tokens[-1] != "mlp":
++        raise ValueError(
++            "block_pattern must end with 'mlp' (each mlp marks the end of one layer); "
++            f"got last token {tokens[-1]!r}."
++        )
++    if "attention" not in tokens:
++        raise ValueError(
++            "block_pattern has no 'attention' sub-layer; mamba_attn_hybrid needs "
++            "at least one."
++        )
++    if "mamba" not in tokens:
++        raise ValueError(
++            "block_pattern has no 'mamba' sub-layer; mamba_attn_hybrid needs "
++            "at least one."
++        )
++    return tokens
++
++
++@SpeculatorModelConfig.register("mamba_attn_hybrid")
++class MambaAttnHybridSpeculatorConfig(MambaAttnHybridBaseConfig):
++
++    speculators_model_type: Literal["mamba_attn_hybrid"] = "mamba_attn_hybrid"
++    architectures: list[str] = Field(
++        default_factory=lambda: ["MambaAttnHybridSpeculator"],
++        description="Model architectures that can load these weights",
++    )
++
++    mamba_d_state: int = Field(default=16, description="SSM state size N.")
++    mamba_num_heads: int = Field(default=64, description="Number of SSD heads.")
++    mamba_head_dim: int = Field(default=64, description="SSD head dimension.")
++    mamba_n_groups: int = Field(default=1, description="Number of B/C groups.")
++    mamba_conv_kernel: int = Field(default=4, description="Depthwise conv width.")
++    mamba_expand: int = Field(default=1, description="Inner-dim expansion factor.")
++
++    latent_fusion_layer_ids: list[int] | None = Field(
++        default=None,
++        description="Verifier hidden-state layer IDs fused into the latent z "
++        "(F = len(latent_fusion_layer_ids)). Must be set at construction.",
++    )
++
++    mamba_seed_mode: Literal["per_layer", "shared", "once"] = Field(
++        default="per_layer",
++        description="How the verifier latent z seeds the SSM initial state across mamba "
++        "sub-layers: 'per_layer' = a distinct seed projection g_i per mamba (default, "
++        "heaviest); 'shared' = one shared projection reused at every mamba; "
++        "'once' = seed only the first mamba (later mambas start from a zero SSM state).",
++    )
++
++    disable_mamba_init_state_injection: bool = Field(
++        default=False,
++        description="Ablation: do not inject the projected verifier latent as the SSM "
++        "initial state. Every mamba sub-layer starts from a ZERO recurrent state, and "
++        "the fusion fc / hidden_norm / fc_norm / seed projections are not built (so "
++        "they carry no weights). mamba_seed_mode is then irrelevant. The verifier "
++        "hidden states are still loaded and used for the loss targets only.",
++    )
++    disable_target_kv_reuse: bool = Field(
++        default=False,
++        description="Ablation: the attention sub-layers never read the verifier KV "
++        "cache. Each block position attends ONLY within its own block (anchor + mask "
++        "slots), with the same intra-block causality rule as before (causal iff the "
++        "sub-layer is windowed and not sliding_window_non_causal). attn_kv_layer_ids "
++        "is still required: it drives the data plumbing and the q/k/v warm-start, but "
++        "the KV is never read.",
++    )
++
++    block_pattern: list[str] | None = Field(
++        default=None,
++        description="Flat list of residual sub-layer tokens from {mamba, attention, "
++        "mlp}; each mlp marks the end of one layer. Must be set at construction.",
++    )
++
++    attn_kv_layer_ids: list[int] | None = Field(
++        default=None,
++        description="Verifier KV layer ID each attention sub-layer reads, in "
++        "attention-block order — the sole verifier-KV source for the hybrid. The data's "
++        "KV set is sorted(set(...)) (== aux_hidden_state_layer_ids). Length must equal "
++        "the number of 'attention' tokens in block_pattern.",
++    )
++
++    attn_rope: list[dict] | None = Field(
++        default=None,
++        description="Per-attention-sub-layer resolved verifier RoPE + sliding-window "
++        "(rope_parameters, sliding_window, layer_type), in attention-block order. Resolved "
++        "at save time from the verifier config; consumed unchanged at inference. Length must "
++        "equal the number of 'attention' tokens in block_pattern (== len(attn_kv_layer_ids)).",
++    )
++
++    use_qk_norm: bool = Field(
++        default=True,
++        description="Apply per-head RMSNorm (q_norm/k_norm) in the draft attention "
++        "sub-layers. An EXPLICIT training choice (--use-qk-norm / --no-use-qk-norm; "
++        "default on) — no verifier auto-detection. The norms only ever act on "
++        "draft-computed Q / noise-K, never on the injected verifier context KV. With "
++        "a normless verifier (llama) and norms ON, they start at ones and are forced "
++        "trainable (no verifier weights to copy).",
++    )
++
++    verifier_layer_prefix: str = Field(
++        default="model.layers",
++        description="Prefix of the verifier's per-layer attention weights used for warm-start "
++        "(e.g. 'model.layers' for qwen3, 'model.language_model.layers' for multimodal gemma4).",
++    )
++
++    markov_rank: int = Field(
++        default=0,
++        ge=0,
++        description="Low-rank dim of the DSpark Markov (correction) logit-bias head "
++        "B = W1 @ W2. 0 disables the head (pure hybrid drafting).",
++    )
++    markov_head_type: Literal["vanilla", "gated", "rnn"] = Field(
++        default="vanilla",
++        description="DSpark correction-head variant: 'vanilla' (first-order Markov bias), "
++        "'gated' (hidden-gated bias), or 'rnn' (recurrent state over the block). Only used "
++        "when markov_rank > 0.",
++    )
++
++    enable_confidence_head: bool = Field(
++        default=False,
++        description="Attach the DSpark per-position acceptance-probability (confidence) "
++        "head. Disabled by default → behavior unchanged when the flag is absent.",
++    )
++    confidence_head_with_markov: bool = Field(
++        default=False,
++        description="Concatenate the Markov previous-token embedding with the backbone "
++        "hidden state as the confidence-head input. Requires markov_rank > 0.",
++    )
++
++    fc_norm: bool = Field(
++        default=False,
++        description="Apply a per-fusion-layer RMSNorm to each of the F verifier hidden "
++        "states (chunked from the F*hidden concat) before the fc fusion projection, "
++        "EAGLE-3 fc_norm style. Default off = unchanged.",
++    )
++
++
++    @model_validator(mode="after")
++    def _validate_previous_token_heads(self):
++        if self.confidence_head_with_markov and self.markov_rank == 0:
++            raise ValueError(
++                "confidence_head_with_markov=True requires markov_rank > 0."
++            )
++        return self
++
++    @field_validator("block_pattern", mode="before")
++    @classmethod
++    def _normalize_block_pattern(cls, value: "str | list[str] | None"):
++        if value is None:
++            return None
++        return parse_block_pattern(value)
+diff --git a/src/speculators/models/mamba_attn_hybrid/core.py b/src/speculators/models/mamba_attn_hybrid/core.py
+new file mode 100644
+index 0000000..df591df
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/core.py
+@@ -0,0 +1,988 @@
++import copy
++import logging
++from typing import ClassVar
++
++import torch
++from torch import nn
++from torch.nn.attention.flex_attention import create_block_mask
++from transformers import AutoConfig, PretrainedConfig
++from transformers.models.qwen3.modeling_qwen3 import (
++    Qwen3RMSNorm,
++    Qwen3RotaryEmbedding,
++)
++
++from speculators.model import DraftVocabMixin, SpeculatorModel
++from speculators.models.mamba_attn_hybrid.attention import (
++    create_anchor_block_mask_mod,
++    create_block_only_mask_mod,
++)
++from speculators.models.mamba_attn_hybrid.metrics import compute_metrics
++from speculators.models.mamba_attn_hybrid.utils import (
++    get_base_indices_for_anchored_blocks,
++    select_anchors,
++)
++from speculators.models.mamba_attn_hybrid.config import (
++    MambaAttnHybridSpeculatorConfig,
++    parse_block_pattern,
++)
++from speculators.models.mamba_attn_hybrid.model_definitions import (
++    HybridAttnSubLayer,
++    HybridMambaSubLayer,
++    HybridMLPSubLayer,
++)
++from speculators.models.mamba_attn_hybrid.loss import (
++    LossConfig,
++    resolve_loss_config,
++)
++from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
++
++logger = logging.getLogger(__name__)
++
++
++def _flat_rope_from_scalars(rope_theta, rope_scaling):
++    rope_dict = {"rope_theta": rope_theta}
++    if isinstance(rope_scaling, dict) and rope_scaling:
++        rope_dict.update(rope_scaling)
++    rope_dict.setdefault("rope_type", "default")
++    return rope_dict
++
++
++def resolve_verifier_rope(real_verifier_config, layer_id):
++    model_type = getattr(real_verifier_config, "model_type", "") or ""
++    rope_params_attr = getattr(real_verifier_config, "rope_parameters", None)
++    if model_type.startswith("qwen") or model_type == "llama":
++        if isinstance(rope_params_attr, dict) and rope_params_attr:
++            rope_dict = dict(rope_params_attr)
++        else:
++            rope_dict = _flat_rope_from_scalars(
++                real_verifier_config.rope_theta,
++                getattr(real_verifier_config, "rope_scaling", None),
++            )
++        return rope_dict, None
++    if "gemma" in model_type:
++        layer_types = getattr(real_verifier_config, "layer_types", None)
++        if layer_types is not None:
++            layer_type = layer_types[layer_id]
++        else:
++            pattern = real_verifier_config.sliding_window_pattern
++            layer_type = (
++                "full_attention"
++                if (layer_id + 1) % pattern == 0
++                else "sliding_attention"
++            )
++        sliding = layer_type == "sliding_attention"
++        if isinstance(rope_params_attr, dict) and layer_type in rope_params_attr:
++            rope_dict = dict(rope_params_attr[layer_type])
++            rope_dict.setdefault("rope_type", "default")
++        elif sliding:
++            rope_dict = {
++                "rope_type": "default",
++                "rope_theta": real_verifier_config.rope_local_base_freq,
++            }
++        else:
++            rope_dict = _flat_rope_from_scalars(
++                real_verifier_config.rope_theta,
++                getattr(real_verifier_config, "rope_scaling", None),
++            )
++        sliding_window = (
++            real_verifier_config.sliding_window if sliding else None
++        )
++        return rope_dict, sliding_window
++    raise ValueError(
++        f"unsupported verifier model_type {model_type!r}; only qwen3, llama, and gemma supported"
++    )
++
++
++def verifier_has_qk_norm(real_verifier_config):
++    model_type = getattr(real_verifier_config, "model_type", "") or ""
++    return model_type != "llama"
++
++
++@SpeculatorModel.register("mamba_attn_hybrid")
++class MambaAttnHybridDraftModel(DraftVocabMixin, SpeculatorModel):
++    config_class: ClassVar[type[MambaAttnHybridSpeculatorConfig]] = MambaAttnHybridSpeculatorConfig  # type: ignore[misc]
++    _no_split_modules = [
++        "HybridMambaSubLayer",
++        "HybridAttnSubLayer",
++        "HybridMLPSubLayer",
++    ]
++    _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
++        "embed_tokens.weight",
++        "verifier_norm.weight",
++        "t2d",
++        "d2t",
++    ]
++    _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
++        "verifier_lm_head.weight",
++        "verifier_norm.weight",
++    ]
++
++    t2d: torch.Tensor | None
++    d2t: torch.Tensor | None
++
++    def __init__(
++        self,
++        config: MambaAttnHybridSpeculatorConfig,
++    ) -> None:
++        if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
++            config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
++                "simple_flex_attention"
++            )
++        super().__init__(config=config)
++        self._init_vocab(config)
++
++        tl_config = config.transformer_layer_config
++        tl_config.use_qk_norm = config.use_qk_norm
++
++        if config.layer_mapping is not None:
++            raise NotImplementedError("layer_mapping not supported for mamba_attn_hybrid")
++
++        if config.aux_hidden_state_layer_ids is None:
++            raise ValueError(
++                "aux_hidden_state_layer_ids must be set in MambaAttnHybridSpeculatorConfig. "
++                "Use MambaAttnHybridDraftModel.from_training_args() to resolve defaults."
++            )
++        self.target_layer_ids = config.aux_hidden_state_layer_ids
++
++        if config.latent_fusion_layer_ids is None:
++            raise ValueError(
++                "latent_fusion_layer_ids must be set in MambaAttnHybridSpeculatorConfig. "
++                "Use MambaAttnHybridDraftModel.from_training_args() to resolve defaults."
++            )
++        self.latent_fusion_layer_ids = config.latent_fusion_layer_ids
++        F = len(self.latent_fusion_layer_ids)
++
++        if config.block_pattern is None:
++            raise ValueError(
++                "block_pattern must be set in MambaAttnHybridSpeculatorConfig. "
++                "Use MambaAttnHybridDraftModel.from_training_args() with --block-pattern."
++            )
++        block_pattern = parse_block_pattern(config.block_pattern)
++        self.block_pattern = block_pattern
++        num_attn = block_pattern.count("attention")
++        num_mamba = block_pattern.count("mamba")
++
++        if config.attn_kv_layer_ids is None:
++            raise ValueError(
++                "attn_kv_layer_ids must be set in MambaAttnHybridSpeculatorConfig "
++                "(one verifier KV layer per attention sub-layer). Use "
++                "MambaAttnHybridDraftModel.from_training_args() with --attn-kv-layer-ids."
++            )
++        if len(config.attn_kv_layer_ids) != num_attn:
++            raise ValueError(
++                f"attn_kv_layer_ids has {len(config.attn_kv_layer_ids)} entries but "
++                f"block_pattern has {num_attn} attention sub-layer(s); they must match."
++            )
++        for lid in config.attn_kv_layer_ids:
++            if lid not in self.target_layer_ids:
++                raise ValueError(
++                    f"attn_kv_layer_ids entry {lid} is not in aux_hidden_state_layer_ids "
++                    f"{self.target_layer_ids}; the data only carries KV for those layers "
++                    "(aux_hidden_state_layer_ids). from_training_args derives this set "
++                    "from --attn-kv-layer-ids, so this only arises from direct config "
++                    "construction with an inconsistent aux_hidden_state_layer_ids."
++                )
++        self.attn_kv_layer_ids = list(config.attn_kv_layer_ids)
++        attn_kv_index = [self.target_layer_ids.index(lid) for lid in self.attn_kv_layer_ids]
++
++        num_attn_layers = num_attn
++        if tl_config.num_hidden_layers != num_attn_layers:
++            raise ValueError(
++                f"transformer_layer_config.num_hidden_layers ({tl_config.num_hidden_layers}) "
++                f"must equal the number of attention sub-layers ({num_attn_layers}). "
++                "train.py derives --num-layers from --block-pattern automatically; if "
++                "constructing the config directly, set num_hidden_layers to the attention count."
++            )
++
++        self.sliding_window = tl_config.sliding_window
++        self.sliding_window_prefix = config.sliding_window_prefix
++        self.sliding_window_non_causal = config.sliding_window_non_causal
++        draft_sw_indices = [
++            i
++            for i in range(num_attn_layers)
++            if tl_config.layer_types[i] == "sliding_attention"
++        ]
++        per_layer_sw = getattr(tl_config, "per_layer_sliding_window", None)
++        if per_layer_sw is not None:
++            self._layer_to_sw = {int(k): v for k, v in per_layer_sw.items()}
++        else:
++            self._layer_to_sw = {i: self.sliding_window for i in draft_sw_indices}
++        if config.attn_rope is not None:
++            for i in range(num_attn_layers):
++                vw = config.attn_rope[i]["sliding_window"]
++                if i not in self._layer_to_sw and vw is not None:
++                    self._layer_to_sw[i] = vw
++        self.sliding_window_indices = sorted(self._layer_to_sw.keys())
++        self.uses_sliding_window_attn = bool(self.sliding_window_indices)
++        self.uses_full_attn = bool(num_attn_layers - len(self.sliding_window_indices))
++
++        self.mamba_d_state = config.mamba_d_state
++        self.mamba_num_heads = config.mamba_num_heads
++        self.mamba_head_dim = config.mamba_head_dim
++
++        seed_mode = config.mamba_seed_mode
++        self.disable_mamba_init_state_injection = bool(
++            getattr(config, "disable_mamba_init_state_injection", False)
++        )
++        self.disable_target_kv_reuse = bool(
++            getattr(config, "disable_target_kv_reuse", False)
++        )
++        layers: list[nn.Module] = []
++        self._sub_type: list[str] = []
++        self._sub_seed_idx: list[int] = []
++        self._sub_kv_idx: list[int] = []
++        self._sub_attn_idx: list[int] = []
++        attn_i = 0
++        mamba_i = 0
++        for tok in block_pattern:
++            if tok == "mamba":
++                layers.append(
++                    HybridMambaSubLayer(
++                        tl_config,
++                        d_state=config.mamba_d_state,
++                        num_heads=config.mamba_num_heads,
++                        head_dim=config.mamba_head_dim,
++                        n_groups=config.mamba_n_groups,
++                        conv_kernel=config.mamba_conv_kernel,
++                        expand=config.mamba_expand,
++                        num_anchors=config.max_anchors,
++                    )
++                )
++                self._sub_type.append("mamba")
++                if self.disable_mamba_init_state_injection:
++                    self._sub_seed_idx.append(-1)
++                elif seed_mode == "per_layer":
++                    self._sub_seed_idx.append(mamba_i)
++                elif seed_mode == "shared":
++                    self._sub_seed_idx.append(0)
++                else:
++                    self._sub_seed_idx.append(0 if mamba_i == 0 else -1)
++                self._sub_kv_idx.append(-1)
++                self._sub_attn_idx.append(-1)
++                mamba_i += 1
++            elif tok == "attention":
++                layers.append(
++                    HybridAttnSubLayer(
++                        tl_config,
++                        layer_idx=attn_i,
++                    )
++                )
++                self._sub_type.append("attention")
++                self._sub_seed_idx.append(-1)
++                self._sub_kv_idx.append(attn_kv_index[attn_i])
++                self._sub_attn_idx.append(attn_i)
++                attn_i += 1
++            else:
++                layers.append(
++                    HybridMLPSubLayer(
++                        tl_config,
++                    )
++                )
++                self._sub_type.append("mlp")
++                self._sub_seed_idx.append(-1)
++                self._sub_kv_idx.append(-1)
++                self._sub_attn_idx.append(-1)
++        self.layers = nn.ModuleList(layers)
++
++        if config.attn_rope is not None:
++            _attn_sublayers = [
++                layer for layer in self.layers if isinstance(layer, HybridAttnSubLayer)
++            ]
++            for _k, _sublayer in enumerate(_attn_sublayers):
++                _sublayer.self_attn.sliding_window = self._layer_to_sw.get(_k, None)
++
++        self.norm = Qwen3RMSNorm(
++            tl_config.hidden_size,
++            eps=tl_config.rms_norm_eps,  # type: ignore[arg-type]
++        )
++        if config.attn_rope is not None:
++            self.rotary_emb = None
++            self._unique_rotaries = nn.ModuleList()
++            _rope_key_to_idx: dict[tuple, int] = {}
++            self.attn_rotary_idx: list[int] | None = []
++            for _entry in config.attn_rope:
++                _rope_params = _entry["rope_parameters"]
++                _rope_type = _rope_params.get("rope_type", "default")
++                _rope_theta = _rope_params["rope_theta"]
++                _key = tuple(sorted((k, str(v)) for k, v in _rope_params.items()))
++                if _key not in _rope_key_to_idx:
++                    _rope_cfg = copy.deepcopy(tl_config)
++                    _rope_cfg.rope_theta = _rope_theta
++                    _rope_cfg.rope_scaling = (
++                        None
++                        if _rope_type in (None, "default")
++                        else {k: v for k, v in _rope_params.items() if k != "rope_theta"}
++                    )
++                    _rope_cfg.partial_rotary_factor = _rope_params.get(
++                        "partial_rotary_factor", 1.0
++                    )
++                    _rope_cfg.rope_parameters = dict(_rope_params)
++                    _rope_cfg.rope_parameters.setdefault("partial_rotary_factor", 1.0)
++                    _rope_key_to_idx[_key] = len(self._unique_rotaries)
++                    self._unique_rotaries.append(
++                        Qwen3RotaryEmbedding(_rope_cfg)  # type: ignore[arg-type]
++                    )
++                self.attn_rotary_idx.append(_rope_key_to_idx[_key])
++        else:
++            _rope_params = getattr(tl_config, "rope_parameters", None)
++            if isinstance(_rope_params, dict) and "partial_rotary_factor" in _rope_params:
++                tl_config.partial_rotary_factor = _rope_params["partial_rotary_factor"]
++            self.rotary_emb = Qwen3RotaryEmbedding(tl_config)  # type: ignore[arg-type]
++            self._unique_rotaries = None
++            self.attn_rotary_idx = None
++
++        self.verifier_norm = Qwen3RMSNorm(
++            tl_config.hidden_size,
++            eps=tl_config.rms_norm_eps,  # type: ignore[arg-type]
++        )
++        self.verifier_norm.weight.requires_grad = False
++
++        if self.disable_mamba_init_state_injection:
++            self.fc = None
++            self.hidden_norm = None
++            self.fc_norm = None
++            self.seed_projs = nn.ModuleList([])
++        else:
++            self.fc = nn.Linear(F * tl_config.hidden_size, tl_config.hidden_size, bias=False)
++            self.hidden_norm = Qwen3RMSNorm(
++                tl_config.hidden_size,
++                eps=tl_config.rms_norm_eps,  # type: ignore[arg-type]
++            )
++
++            self.fc_norm = (
++                nn.ModuleList(
++                    [
++                        Qwen3RMSNorm(tl_config.hidden_size, eps=tl_config.rms_norm_eps)
++                        for _ in range(F)
++                    ]
++                )
++                if config.fc_norm
++                else None
++            )
++
++            seed_out = config.mamba_num_heads * config.mamba_head_dim * config.mamba_d_state
++            num_seed_projs = num_mamba if seed_mode == "per_layer" else 1
++            self.seed_projs = nn.ModuleList(
++                [nn.Linear(tl_config.hidden_size, seed_out, bias=False) for _ in range(num_seed_projs)]
++            )
++
++        self.block_size = config.block_size
++
++        hidden_size = tl_config.hidden_size
++        self.markov_head: MarkovHead | None = None
++        if config.markov_rank > 0:
++            self.markov_head = MarkovHead(
++                verifier_vocab_size=self.verifier_vocab_size,
++                draft_vocab_size=self.draft_vocab_size,
++                markov_rank=config.markov_rank,
++                hidden_size=hidden_size,
++                head_type=config.markov_head_type,
++            )
++        self.confidence_head: ConfidenceHead | None = None
++        if config.enable_confidence_head:
++            if config.confidence_head_with_markov and self.markov_head is None:
++                raise ValueError(
++                    "confidence_head_with_markov=True requires markov_rank > 0."
++                )
++            conf_in_dim = hidden_size + (
++                config.markov_rank if config.confidence_head_with_markov else 0
++            )
++            self.confidence_head = ConfidenceHead(conf_in_dim)
++
++        logger.info("mamba_attn_hybrid recipe: %s", " ".join(block_pattern))
++        for k, lid in enumerate(self.attn_kv_layer_ids):
++            logger.info("Attention block %d <- verifier KV layer %d (direct)", k, lid)
++
++        self.post_init()
++
++    def load_verifier_weights(self):
++        from speculators.utils.loading import load_model_layers  # noqa: PLC0415
++
++        super().load_verifier_weights()
++
++        mask_token_id = getattr(self.config, "mask_token_id", None)
++        if (
++            mask_token_id is not None
++            and 0 <= mask_token_id < self.embed_tokens.weight.shape[0]
++            and self.embed_tokens.weight[mask_token_id].float().norm().item() < 1e-4
++        ):
++            table = self.embed_tokens.weight
++            dead_l2 = table[mask_token_id].float().norm().item()
++            std = table.float().std().item()
++            generator = torch.Generator().manual_seed(0)
++            new_row = torch.randn(table.shape[1], generator=generator) * std
++            with torch.no_grad():
++                table[mask_token_id] = new_row.to(dtype=table.dtype, device=table.device)
++            logger.warning(
++                "mask_token_id=%d has a numerically dead verifier embedding row "
++                "(L2=%.3e); re-initialized from a fixed seed with std=%.5f "
++                "(new L2=%.4f) and kept frozen.",
++                mask_token_id,
++                dead_l2,
++                std,
++                table[mask_token_id].float().norm().item(),
++            )
++
++        verifier_path = self.config.speculators_config.verifier.name_or_path
++        if verifier_path is None:
++            return
++
++        cfg = self.config
++
++        if cfg.init_q_proj == "random" and not cfg.trainable_q_proj:
++            raise ValueError("init_q_proj='random' requires trainable_q_proj=True")
++        if cfg.init_kv_proj == "random" and not cfg.trainable_kv_proj:
++            raise ValueError("init_kv_proj='random' requires trainable_kv_proj=True")
++        use_qk_norm = getattr(cfg, "use_qk_norm", True)
++        if use_qk_norm and cfg.init_q_norm == "random" and not cfg.trainable_q_norm:
++            raise ValueError("init_q_norm='random' requires trainable_q_norm=True")
++        if use_qk_norm and cfg.init_k_norm == "random" and not cfg.trainable_k_norm:
++            raise ValueError("init_k_norm='random' requires trainable_k_norm=True")
++
++        layer_prefix = getattr(self.config, "verifier_layer_prefix", "model.layers")
++        load_layer_ids = sorted(set(self.attn_kv_layer_ids))
++        weight_names = []
++        for layer_id in load_layer_ids:
++            prefix = f"{layer_prefix}.{layer_id}.self_attn"
++            names = [
++                f"{prefix}.q_proj.weight",
++                f"{prefix}.k_proj.weight",
++                f"{prefix}.v_proj.weight",
++            ]
++            if use_qk_norm:
++                names.append(f"{prefix}.q_norm.weight")
++                names.append(f"{prefix}.k_norm.weight")
++            weight_names.extend(names)
++        weight_names = list(dict.fromkeys(weight_names))
++        verifier_weights = load_model_layers(weight_names, verifier_path) if weight_names else {}
++
++        attn_sublayers = [
++            layer for layer in self.layers if isinstance(layer, HybridAttnSubLayer)
++        ]
++        for k, sublayer in enumerate(attn_sublayers):
++            attn = sublayer.self_attn
++            lid = self.attn_kv_layer_ids[k]
++            prefix = f"{layer_prefix}.{lid}.self_attn"
++
++            if cfg.init_q_proj == "verifier":
++                attn.q_proj.load_state_dict({"weight": verifier_weights[f"{prefix}.q_proj.weight"]})
++            attn.q_proj.weight.requires_grad = cfg.trainable_q_proj
++
++            if cfg.init_kv_proj == "verifier":
++                attn.k_proj.load_state_dict({"weight": verifier_weights[f"{prefix}.k_proj.weight"]})
++                v_key = f"{prefix}.v_proj.weight"
++                has_v_proj = v_key in verifier_weights
++                if not has_v_proj:
++                    logger.warning("Verifier layer %s has no v_proj (k_eq_v); initializing draft v_proj from k_proj.", prefix)
++                v_weight = verifier_weights.get(
++                    f"{prefix}.v_proj.weight", verifier_weights[f"{prefix}.k_proj.weight"]
++                )
++                attn.v_proj.load_state_dict({"weight": v_weight})
++            attn.k_proj.weight.requires_grad = cfg.trainable_kv_proj
++            attn.v_proj.weight.requires_grad = cfg.trainable_kv_proj
++
++            if use_qk_norm:
++                w_q = verifier_weights.get(f"{prefix}.q_norm.weight")
++                if cfg.init_q_norm == "verifier" and w_q is not None:
++                    attn.q_norm.load_state_dict({"weight": w_q})
++                attn.q_norm.weight.requires_grad = cfg.trainable_q_norm or w_q is None
++
++                w_k = verifier_weights.get(f"{prefix}.k_norm.weight")
++                if cfg.init_k_norm == "verifier" and w_k is not None:
++                    attn.k_norm.load_state_dict({"weight": w_k})
++                attn.k_norm.weight.requires_grad = cfg.trainable_k_norm or w_k is None
++
++    @classmethod
++    def from_training_args(
++        cls,
++        verifier_config: "PretrainedConfig",
++        t2d: torch.Tensor | None = None,
++        d2t: torch.Tensor | None = None,
++        **kwargs,
++    ) -> "MambaAttnHybridDraftModel":
++        from speculators.config import (  # noqa: PLC0415
++            SpeculatorsConfig,
++            VerifierConfig,
++        )
++        from speculators.proposals.greedy import (  # noqa: PLC0415
++            GreedyTokenProposalConfig,
++        )
++
++        if kwargs.get("layer_mapping") is not None:
++            raise NotImplementedError("layer_mapping not supported for mamba_attn_hybrid")
++
++        if kwargs.get("block_pattern") is None:
++            raise ValueError(
++                "--block-pattern is required for --speculator-type mamba_attn_hybrid, e.g. "
++                "mamba mlp mamba mlp mamba attention mlp."
++            )
++        block_pattern = parse_block_pattern(kwargs["block_pattern"])
++        num_attn = block_pattern.count("attention")
++
++        if kwargs.get("target_layer_ids") is not None:
++            raise ValueError(
++                "--target-layer-ids is not used by mamba_attn_hybrid; the verifier-KV "
++                "layers come from --attn-kv-layer-ids (pass the same ids to "
++                "launch_vllm_nkv.py --attn-kv-layer-ids at data-gen)."
++            )
++        attn_kv_layer_ids = kwargs.get("attn_kv_layer_ids")
++        if attn_kv_layer_ids is None:
++            raise ValueError(
++                "--attn-kv-layer-ids is required for mamba_attn_hybrid: it lists, in "
++                "attention-block order, the verifier KV layer each attention sub-layer "
++                "reads, and defines the data's KV set (= sorted(set(...)))."
++            )
++        if len(attn_kv_layer_ids) != num_attn:
++            raise ValueError(
++                f"--attn-kv-layer-ids has {len(attn_kv_layer_ids)} entries but "
++                f"--block-pattern has {num_attn} attention sub-layer(s); they must match."
++            )
++        target_layer_ids = sorted(set(attn_kv_layer_ids))
++
++        latent_fusion_layer_ids = kwargs.get("latent_fusion_layer_ids")
++        if latent_fusion_layer_ids is None:
++            latent_fusion_layer_ids = list(target_layer_ids)
++
++        real_verifier_config = AutoConfig.from_pretrained(
++            kwargs["verifier_name_or_path"], trust_remote_code=True
++        )
++        verifier_is_multimodal = hasattr(real_verifier_config, "text_config")
++        if verifier_is_multimodal:
++            real_verifier_config = real_verifier_config.text_config
++        verifier_layer_prefix = (
++            "model.language_model.layers" if verifier_is_multimodal else "model.layers"
++        )
++        n_verifier_layers = real_verifier_config.num_hidden_layers
++        bad_ids = [lid for lid in target_layer_ids if not 0 <= lid < n_verifier_layers]
++        if bad_ids:
++            raise ValueError(
++                f"--attn-kv-layer-ids {bad_ids} out of range for a verifier with "
++                f"{n_verifier_layers} layers (valid 0..{n_verifier_layers - 1})."
++            )
++        def _reused_layer_attn_geom(lid):
++            base_hd = getattr(real_verifier_config, "head_dim", None)
++            base_kv = getattr(real_verifier_config, "num_key_value_heads", None)
++            global_hd = getattr(real_verifier_config, "global_head_dim", None)
++            global_kv = getattr(
++                real_verifier_config, "num_global_key_value_heads", None
++            )
++            _, _sw = resolve_verifier_rope(real_verifier_config, lid)
++            is_full = _sw is None
++            k_eq_v = getattr(real_verifier_config, "attention_k_eq_v", False)
++            hd = global_hd if (is_full and global_hd is not None) else base_hd
++            kv = (
++                global_kv
++                if (is_full and k_eq_v and global_kv is not None)
++                else base_kv
++            )
++            return (hd, kv)
++
++        _reused_geoms = {_reused_layer_attn_geom(lid) for lid in target_layer_ids}
++        if len(_reused_geoms) > 1:
++            raise NotImplementedError(
++                "reused verifier layers have non-uniform attention geometry "
++                f"(head_dim, num_kv_heads) {sorted(_reused_geoms)}; per-sub-layer attention "
++                "geometry is not supported — pick reused layers of one attention type."
++            )
++        if getattr(real_verifier_config, "attn_logit_softcapping", None):
++            raise ValueError(
++                "verifier attn_logit_softcapping is set but the hybrid draft attention does "
++                "not support attention logit soft-capping."
++            )
++
++        _reused_hd, _reused_kv = next(iter(_reused_geoms))
++        if _reused_hd is not None:
++            verifier_config.head_dim = _reused_hd
++        if _reused_kv is not None:
++            verifier_config.num_key_value_heads = _reused_kv
++
++        attn_rope = []
++        for i in range(num_attn):
++            rope_dict, sliding_window = resolve_verifier_rope(
++                real_verifier_config, attn_kv_layer_ids[i]
++            )
++            layer_type = (
++                "sliding_attention" if sliding_window is not None else "full_attention"
++            )
++            attn_rope.append(
++                {
++                    "rope_parameters": rope_dict,
++                    "sliding_window": sliding_window,
++                    "layer_type": layer_type,
++                }
++            )
++
++        if attn_rope:
++            verifier_config.rope_parameters = dict(attn_rope[0]["rope_parameters"])
++            verifier_config.partial_rotary_factor = 1.0
++
++        use_qk_norm = bool(kwargs.get("use_qk_norm", True))
++        if use_qk_norm and not verifier_has_qk_norm(real_verifier_config):
++            logger.warning(
++                "use_qk_norm=True with a normless verifier (model_type=%r): draft "
++                "q_norm/k_norm start at ones and are forced trainable (no verifier "
++                "weights to copy).",
++                getattr(real_verifier_config, "model_type", ""),
++            )
++        if not use_qk_norm and (
++            kwargs.get("trainable_q_norm", False) or kwargs.get("trainable_k_norm", False)
++        ):
++            logger.warning(
++                "--no-use-qk-norm: ignoring --trainable-q-norm/--trainable-k-norm "
++                "(norms disabled).",
++            )
++
++        config = MambaAttnHybridSpeculatorConfig(
++            transformer_layer_config=verifier_config,
++            draft_vocab_size=kwargs["draft_vocab_size"],
++            block_size=kwargs.get("block_size", 8),
++            max_anchors=kwargs.get("max_anchors", 3072),
++            aux_hidden_state_layer_ids=target_layer_ids,
++            mask_token_id=kwargs.get("mask_token_id"),
++            sliding_window_non_causal=kwargs.get("sliding_window_non_causal", False),
++            sliding_window_prefix=kwargs.get("sliding_window_prefix", 0),
++            trainable_q_proj=kwargs.get("trainable_q_proj", False),
++            trainable_kv_proj=kwargs.get("trainable_kv_proj", False),
++            trainable_q_norm=kwargs.get("trainable_q_norm", False),
++            trainable_k_norm=kwargs.get("trainable_k_norm", False),
++            init_q_proj=kwargs.get("init_q_proj", "verifier"),
++            init_kv_proj=kwargs.get("init_kv_proj", "verifier"),
++            init_q_norm=kwargs.get("init_q_norm", "verifier"),
++            init_k_norm=kwargs.get("init_k_norm", "verifier"),
++            use_qk_norm=use_qk_norm,
++            verifier_layer_prefix=verifier_layer_prefix,
++            layer_mapping=None,
++            mamba_d_state=kwargs.get("mamba_d_state", 16),
++            mamba_num_heads=kwargs.get("mamba_num_heads", 64),
++            mamba_head_dim=kwargs.get("mamba_head_dim", 64),
++            mamba_n_groups=kwargs.get("mamba_n_groups", 1),
++            mamba_conv_kernel=kwargs.get("mamba_conv_kernel", 4),
++            mamba_expand=kwargs.get("mamba_expand", 1),
++            latent_fusion_layer_ids=latent_fusion_layer_ids,
++            mamba_seed_mode=kwargs.get("mamba_seed_mode", "per_layer"),
++            disable_mamba_init_state_injection=kwargs.get(
++                "disable_mamba_init_state_injection", False
++            ),
++            disable_target_kv_reuse=kwargs.get("disable_target_kv_reuse", False),
++            block_pattern=block_pattern,
++            attn_kv_layer_ids=attn_kv_layer_ids,
++            attn_rope=attn_rope,
++            markov_rank=kwargs.get("markov_rank", 0),
++            markov_head_type=kwargs.get("markov_head_type", "vanilla"),
++            enable_confidence_head=kwargs.get("enable_confidence_head", False),
++            confidence_head_with_markov=kwargs.get("confidence_head_with_markov", False),
++            fc_norm=kwargs.get("fc_norm", False),
++            speculators_config=SpeculatorsConfig(
++                algorithm="mamba_attn_hybrid",
++                proposal_methods=[
++                    GreedyTokenProposalConfig(
++                        speculative_tokens=kwargs.get("block_size", 8) - 1,
++                    )
++                ],
++                default_proposal_method="greedy",
++                verifier=VerifierConfig.from_config(
++                    verifier_config, name_or_path=kwargs["verifier_name_or_path"]
++                ),
++            ),
++        )
++
++        model = cls(config=config)
++        model.load_vocab_mappings(t2d, d2t)
++        model.load_verifier_weights()
++        return model
++
++    @staticmethod
++    def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
++        loss_config = resolve_loss_config(kwargs.get("loss_fn", "ce"))
++        shared = {
++            "parallel_drafting_loss_weight": kwargs.get(
++                "parallel_drafting_loss_weight", "dflash"
++            ),
++            "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
++            "confidence_head_alpha": kwargs.get("confidence_head_alpha", 1.0),
++            "loss_config": loss_config,
++        }
++        return dict(shared), dict(shared)
++
++    @property
++    def mask_token_id(self) -> int:
++        if self.config.mask_token_id is None:
++            raise ValueError(
++                "mask_token_id is not set on the config. "
++                "Pass --mask-token-id during training or ensure the config "
++                "was saved with mask_token_id set."
++            )
++        return self.config.mask_token_id
++
++    @torch.compiler.disable
++    def _build_attention_mask(self, loss_mask, document_ids, device):
++        total_seq_len = loss_mask.shape[1]
++
++        anchor_positions, anchor_valid = select_anchors(
++            loss_mask, self.config.max_anchors, self.block_size
++        )
++
++        full_attn_mask = None
++        if self.uses_full_attn:
++            mask_mod, q_len, kv_len = (
++                create_block_only_mask_mod(
++                    anchor_positions=anchor_positions,
++                    block_size=self.block_size,
++                    sliding_window=None,
++                )
++                if self.disable_target_kv_reuse
++                else create_anchor_block_mask_mod(
++                    document_ids=document_ids.squeeze(0).to(device),
++                    total_seq_len=total_seq_len,
++                    anchor_positions=anchor_positions,
++                    block_size=self.block_size,
++                    sliding_window=None,
++                )
++            )
++            full_attn_mask = create_block_mask(
++                mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
++            )
++
++        sw_masks = {}
++        if self.uses_sliding_window_attn:
++            unique_sws = sorted(set(self._layer_to_sw.values()))
++            for sw in unique_sws:
++                mask_mod, q_len, kv_len = (
++                    create_block_only_mask_mod(
++                        anchor_positions=anchor_positions,
++                        block_size=self.block_size,
++                        sliding_window=sw,
++                        sliding_window_non_causal=self.sliding_window_non_causal,
++                    )
++                    if self.disable_target_kv_reuse
++                    else create_anchor_block_mask_mod(
++                        document_ids=document_ids.squeeze(0).to(device),
++                        total_seq_len=total_seq_len,
++                        anchor_positions=anchor_positions,
++                        block_size=self.block_size,
++                        sliding_window=sw,
++                        sliding_window_non_causal=self.sliding_window_non_causal,
++                        sliding_window_prefix=self.sliding_window_prefix,
++                    )
++                )
++                sw_masks[sw] = create_block_mask(
++                    mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
++                )
++
++        return full_attn_mask, sw_masks, anchor_positions, anchor_valid
++
++    @torch.compile
++    def forward(
++        self,
++        kv_caches: torch.Tensor,
++        input_ids: torch.Tensor,
++        loss_mask: torch.Tensor,
++        verifier_hidden_states: torch.Tensor,
++        verifier_last_hidden_states: torch.Tensor,
++        document_ids: torch.Tensor | None = None,
++        position_ids: torch.Tensor | None = None,
++        parallel_drafting_loss_weight: str = "dflash",
++        dpace_alpha: float = 0.5,
++        confidence_head_alpha: float = 1.0,
++        loss_config: LossConfig | None = None,
++        **kwargs,
++    ):
++        kv_caches = kv_caches.squeeze(0).permute(1, 2, 0, 3, 4).contiguous()
++
++        device = kv_caches.device
++        total_seq_len = input_ids.shape[1]
++        num_anchors = self.config.max_anchors
++
++        if (
++            not self.disable_mamba_init_state_injection
++            and verifier_hidden_states.shape[-1] != self.fc.in_features
++        ):
++            raise ValueError(
++                f"verifier_hidden_states width {verifier_hidden_states.shape[-1]} != "
++                f"fc.in_features {self.fc.in_features} "
++                f"(F_train={len(self.latent_fusion_layer_ids)}); "
++                "--latent-fusion-layer-ids must match between launch_vllm_nkv.py "
++                "(data-gen) and scripts/train.py (training)."
++            )
++
++        if kv_caches.shape[0] != len(self.target_layer_ids):
++            raise ValueError(
++                f"injected verifier KV layer count {kv_caches.shape[0]} != "
++                f"len(target_layer_ids) {len(self.target_layer_ids)} "
++                f"({self.target_layer_ids}); the data's KV set must equal "
++                "sorted(set(--attn-kv-layer-ids)) — keep --attn-kv-layer-ids consistent "
++                "between launch_vllm_nkv.py (data-gen) and scripts/train.py (training)."
++            )
++
++        if document_ids is None:
++            document_ids = torch.zeros(
++                (1, total_seq_len), dtype=torch.long, device=device
++            )
++        if position_ids is None:
++            position_ids = 1 + torch.arange(
++                total_seq_len, dtype=torch.long, device=device
++            ).unsqueeze(0)
++
++        full_attn_mask, sw_masks, anchor_positions, anchor_valid = self._build_attention_mask(
++            loss_mask, document_ids, device
++        )
++
++        anchor_valid = anchor_valid & (anchor_positions > 0)
++
++        mask_tokens_size = num_anchors * self.block_size
++        mask_token_ids = torch.full(
++            (1, mask_tokens_size),
++            self.mask_token_id,
++            dtype=torch.long,
++            device=device,
++        )
++        mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
++        noise_embedding = self.embed_tokens(mask_token_ids)
++
++        per_layer_kv = []
++        for i in range(kv_caches.shape[0]):
++            k = kv_caches[i, 0].unsqueeze(0).transpose(1, 2)
++            v = kv_caches[i, 1].unsqueeze(0).transpose(1, 2)
++            if self.disable_target_kv_reuse:
++                k, v = k[:, :, :0], v[:, :, :0]
++            per_layer_kv.append((k, v))
++
++        mask_position_ids = get_base_indices_for_anchored_blocks(
++            position_ids[:, anchor_positions], self.block_size, input_ids.numel()
++        )
++        position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
++
++        if self._unique_rotaries is not None:
++            unique_position_embeddings = [
++                rotary(noise_embedding, position_ids)
++                for rotary in self._unique_rotaries
++            ]
++            position_embeddings = None
++        else:
++            position_embeddings = self.rotary_emb(noise_embedding, position_ids)
++            unique_position_embeddings = None
++
++        anchored_block_indices = get_base_indices_for_anchored_blocks(
++            anchor_positions, self.block_size, input_ids.numel()
++        )
++
++        if self.disable_mamba_init_state_injection:
++            z = None
++        else:
++            seed_positions = (anchor_positions - 1).clamp(min=0)
++            fusion_part = verifier_hidden_states[:, seed_positions, :]
++            if self.fc_norm is not None:
++                chunks = fusion_part.chunk(len(self.fc_norm), dim=-1)
++                fusion_part = torch.cat(
++                    [norm(c) for norm, c in zip(self.fc_norm, chunks, strict=True)], dim=-1
++                )
++            z = self.hidden_norm(self.fc(fusion_part)).squeeze(0)
++
++        with torch.no_grad():
++            verifier_logits = self.verifier_lm_head(
++                self.verifier_norm(verifier_last_hidden_states)
++            )
++            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
++            targets = verifier_logits[:, anchored_block_indices]
++
++        for i, layer in enumerate(self.layers):
++            t = self._sub_type[i]
++            if t == "mamba":
++                seed_idx = self._sub_seed_idx[i]
++                if seed_idx >= 0:
++                    ssm_state0 = self.seed_projs[seed_idx](z).view(
++                        num_anchors,
++                        self.mamba_num_heads,
++                        self.mamba_head_dim,
++                        self.mamba_d_state,
++                    )
++                else:
++                    ssm_state0 = None
++                noise_embedding = layer(noise_embedding, ssm_state0)
++            elif t == "attention":
++                kv_idx = self._sub_kv_idx[i]
++                attn_idx = self._sub_attn_idx[i]
++                if attn_idx in self._layer_to_sw:
++                    attn_mask = sw_masks[self._layer_to_sw[attn_idx]]
++                else:
++                    attn_mask = full_attn_mask
++                if unique_position_embeddings is not None:
++                    sub_position_embeddings = unique_position_embeddings[
++                        self.attn_rotary_idx[attn_idx]
++                    ]
++                else:
++                    sub_position_embeddings = position_embeddings
++                noise_embedding = layer(
++                    noise_embedding,
++                    context_kv=per_layer_kv[kv_idx],
++                    attention_mask=attn_mask,
++                    position_ids=position_ids,
++                    position_embeddings=sub_position_embeddings,
++                    use_cache=False,
++                    **kwargs,
++                )
++            else:
++                noise_embedding = layer(noise_embedding)
++
++        hidden = self.norm(noise_embedding)
++        logits = self.lm_head(hidden)
++
++        confidence_logits = None
++        if (
++            self.markov_head is not None
++            or self.confidence_head is not None
++        ):
++            block = self.block_size
++            block_tokens = input_ids[0, anchored_block_indices].view(num_anchors, block)
++            prev_token_ids = torch.cat(
++                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
++            )
++            hidden_blocks = hidden.view(num_anchors, block, -1)
++
++            prev_emb = None
++            if self.markov_head is not None:
++                prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
++                markov_bias = self.markov_head.block_bias(
++                    prev_token_ids=prev_token_ids,
++                    hidden_states=hidden_blocks,
++                    prev_emb=prev_emb,
++                )
++                logits = (logits.view(num_anchors, block, -1) + markov_bias).view(
++                    1, num_anchors * block, -1
++                )
++
++            if self.confidence_head is not None:
++                if self.config.confidence_head_with_markov and prev_emb is not None:
++                    conf_features = torch.cat(
++                        [hidden_blocks.detach(), prev_emb.detach().to(hidden_blocks.dtype)],
++                        dim=-1,
++                    )
++                else:
++                    conf_features = hidden_blocks.detach()
++                confidence_logits = self.confidence_head(conf_features).reshape(
++                    1, num_anchors * block
++                )
++
++        aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
++
++        aligned_loss_mask = aligned_loss_mask * (
++            anchor_valid.repeat_interleave(self.block_size)
++            .unsqueeze(0)
++            .to(aligned_loss_mask.dtype)
++        )
++
++        aligned_loss_mask[:, :: self.block_size] = 0
++        loss, metrics = compute_metrics(
++            logits,
++            targets,
++            aligned_loss_mask,
++            self.block_size,
++            parallel_drafting_loss_weight=parallel_drafting_loss_weight,
++            dpace_alpha=dpace_alpha,
++            confidence_logits=confidence_logits,
++            confidence_head_alpha=confidence_head_alpha,
++            loss_config=loss_config,
++        )
++        draft_tokens = torch.argmax(logits, dim=-1)
++
++        return draft_tokens, loss, metrics
+diff --git a/src/speculators/models/mamba_attn_hybrid/loss.py b/src/speculators/models/mamba_attn_hybrid/loss.py
+new file mode 100644
+index 0000000..ed46709
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/loss.py
+@@ -0,0 +1,199 @@
++import json
++from collections.abc import Callable
++
++import torch
++
++_EPS = 1e-5
++
++LossConfig = dict[
++    str, tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]
++]
++
++
++def compute_accuracy_single_step(
++    pred_ids: torch.Tensor,
++    target_ids: torch.Tensor,
++    loss_mask: torch.Tensor | None,
++    prev_correct: torch.Tensor | None,
++):
++    correct = pred_ids == target_ids
++    cond_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
++    if prev_correct is not None:
++        cond_total = prev_correct.sum().float()
++        correct = torch.logical_and(prev_correct, correct, out=prev_correct)
++    if loss_mask is not None:
++        correct = torch.masked_select(correct, loss_mask.to(torch.bool))
++
++    correct_sum = correct.float().sum()
++    full_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
++
++    return correct_sum, full_total, correct_sum, cond_total
++
++
++@torch.no_grad()
++def compute_accuracy_multi_step(
++    pred_ids: torch.Tensor,
++    target_ids: torch.Tensor,
++    loss_mask: torch.Tensor,
++    pos_idx: torch.Tensor,
++    num_pos: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    correct = pred_ids == target_ids
++    correct = torch.masked_select(correct, loss_mask.to(torch.bool))
++    pos_idx = torch.masked_select(pos_idx, loss_mask.to(torch.bool))
++
++    correct_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
++    total_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
++    correct_per_pos.scatter_add_(0, pos_idx, correct.float())
++    total_per_pos.scatter_add_(0, pos_idx, torch.ones_like(correct, dtype=torch.float))
++
++    return correct_per_pos, total_per_pos
++
++
++def kl_div_loss(
++    logits: torch.Tensor,
++    targets: torch.Tensor,
++):
++    logits = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
++    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
++    elementwise_loss = torch.nn.functional.kl_div(
++        logits, target_p, reduction="none", log_target=False
++    ).sum(dim=-1)
++
++    return elementwise_loss  # noqa: RET504
++
++
++def ce_loss(
++    logits: torch.Tensor,
++    targets: torch.Tensor,
++):
++    batch_size, seq_len, draft_vocab_size = logits.shape
++    target_ids = torch.argmax(targets, dim=-1)
++
++    elementwise_loss = torch.nn.functional.cross_entropy(
++        logits.reshape(-1, draft_vocab_size),
++        target_ids.reshape(-1),
++        reduction="none",
++        ignore_index=-100,
++    ).reshape(batch_size, seq_len)
++
++    return elementwise_loss  # noqa: RET504
++
++
++def tv_loss(
++    logits: torch.Tensor,
++    targets: torch.Tensor,
++):
++    draft_p = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
++    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
++    overlap = torch.minimum(draft_p, target_p).sum(dim=-1)
++    elementwise_loss = 1.0 - overlap
++
++    return elementwise_loss  # noqa: RET504
++
++
++def dflash_loss_decay(pos_idx: torch.Tensor, gamma: float):
++    decay_mult = torch.exp(-((pos_idx - 1).clamp(min=0)) / gamma)
++    decay_mult = decay_mult * (pos_idx != 0).to(decay_mult.dtype)
++    return decay_mult  # noqa: RET504
++
++
++def exp_loss_decay(pos_idx: torch.Tensor, gamma: float):
++    return gamma**pos_idx
++
++
++def dpace_loss_weight(
++    neg_log_q: torch.Tensor,
++    loss_mask: torch.Tensor,
++    block_size: int,
++    alpha: float = 0.5,
++):
++    with torch.no_grad():
++        q = torch.exp(-neg_log_q).float()
++
++        num_anchors = q.shape[1] // block_size
++        q = q.reshape(num_anchors, block_size)
++        mask = loss_mask.reshape(num_anchors, block_size).to(q.dtype)
++
++        smooth = (1.0 - alpha) * q + alpha
++        smooth = torch.where(mask > 0, smooth, torch.ones_like(smooth))
++
++        prefix = torch.cumprod(smooth, dim=-1)
++
++        weight = torch.flip(
++            torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1]
++        )
++        weight = weight * mask
++
++    return weight.reshape(1, -1)
++
++
++def loss_function(
++    logits: torch.Tensor,
++    targets: torch.Tensor,
++    loss_mask: torch.Tensor,
++    pos_idx: torch.Tensor,
++    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
++    decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
++    decay_mult: torch.Tensor | None = None,
++    elementwise_loss: torch.Tensor | None = None,
++):
++    if elementwise_loss is None:
++        elementwise_loss = loss_fn(logits, targets)
++
++    loss_mask = loss_mask.to(elementwise_loss.dtype)
++    elementwise_loss = elementwise_loss * loss_mask
++
++    if decay_mult is not None:
++        elementwise_loss = elementwise_loss * decay_mult.to(elementwise_loss.dtype)
++    elif decay_fn is not None:
++        decay_mult = decay_fn(pos_idx.to(elementwise_loss.dtype))
++        elementwise_loss = elementwise_loss * decay_mult
++
++    denominator = loss_mask.sum(dim=1) + _EPS
++
++    batch_loss = torch.sum(elementwise_loss, dim=1) / denominator
++    return batch_loss.mean()
++
++
++_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
++    "kl_div": kl_div_loss,
++    "ce": ce_loss,
++    "tv": tv_loss,
++}
++
++
++def resolve_loss_config(spec: str) -> LossConfig:
++    if spec in _LOSS_FN_MAP:
++        return {spec: (_LOSS_FN_MAP[spec], 1.0)}
++
++    try:
++        parsed = json.loads(spec)
++    except json.JSONDecodeError:
++        raise ValueError(
++            f"Unknown loss function '{spec}'. Pass a known name "
++            f"({sorted(_LOSS_FN_MAP.keys())}) or a JSON dict, "
++            f'e.g. \'{{"ce": 0.1, "tv": 0.9}}\'.'
++        ) from None
++
++    if not isinstance(parsed, dict) or not parsed:
++        raise ValueError(
++            "Loss config must be a non-empty JSON dict mapping loss names to weights, "
++            f'e.g. \'{{"ce": 0.1, "tv": 0.9}}\'. Got: {spec}'
++        )
++
++    config: LossConfig = {}
++    for name, weight in parsed.items():
++        if name not in _LOSS_FN_MAP:
++            raise ValueError(
++                f"Unknown loss function '{name}' in loss config. "
++                f"Choose from: {sorted(_LOSS_FN_MAP.keys())}"
++            )
++        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
++            raise ValueError(
++                f"Loss weight for '{name}' must be a number, "
++                f"got {type(weight).__name__}"
++            )
++        config[name] = (_LOSS_FN_MAP[name], float(weight))
++
++    return config
+diff --git a/src/speculators/models/mamba_attn_hybrid/mamba.py b/src/speculators/models/mamba_attn_hybrid/mamba.py
+new file mode 100644
+index 0000000..e12bd85
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/mamba.py
+@@ -0,0 +1,131 @@
++import logging
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++logger = logging.getLogger(__name__)
++
++try:
++    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
++
++    _HAS_KERNEL = True
++except Exception:  # noqa: BLE001
++    mamba_chunk_scan_combined = None
++    _HAS_KERNEL = False
++
++_WARNED_NO_KERNEL = False
++
++
++def _warn_if_gpu_without_kernel(x: torch.Tensor) -> None:
++    global _WARNED_NO_KERNEL
++    if x.is_cuda and not _HAS_KERNEL and not _WARNED_NO_KERNEL:
++        logger.warning(
++            "mamba_ssm not installed: MambaDraft is running the slow pure-PyTorch "
++            "SSD reference scan on GPU. Install mamba-ssm for production speed."
++        )
++        _WARNED_NO_KERNEL = True
++
++
++class _RMSNormGated(nn.Module):
++    def __init__(self, dim: int, eps: float = 1e-5) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(dim))
++        self.eps = eps
++
++    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
++        input_dtype = x.dtype
++        x = x.float()
++        if gate is not None:
++            x = x * F.silu(gate.float())
++        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
++        return self.weight * x.to(input_dtype)
++
++
++def _ssd_reference(x, dt, A, B, C, D, initial_states):
++    b, L, h, p = x.shape
++    g, n = B.shape[2], B.shape[3]
++    rep = h // g
++    B = B.repeat_interleave(rep, dim=2)
++    C = C.repeat_interleave(rep, dim=2)
++    state = initial_states
++    ys = []
++    for t in range(L):
++        dA = torch.exp(dt[:, t] * A)
++        dBx = dt[:, t][..., None, None] * (x[:, t][..., None] * B[:, t][:, :, None, :])
++        state = dA[..., None, None] * state + dBx
++        y = (state * C[:, t][:, :, None, :]).sum(-1) + D[None, :, None] * x[:, t]
++        ys.append(y)
++    return torch.stack(ys, dim=1)
++
++
++class MambaDraftMixer(nn.Module):
++    def __init__(
++        self,
++        hidden_size: int,
++        d_state: int,
++        num_heads: int,
++        head_dim: int,
++        n_groups: int,
++        conv_kernel: int,
++        expand: int,
++    ) -> None:
++        super().__init__()
++        self.hidden_size = hidden_size
++        self.d_inner = num_heads * head_dim
++        self.num_heads, self.head_dim = num_heads, head_dim
++        self.n_groups, self.d_state = n_groups, d_state
++        self.conv_kernel = conv_kernel
++        self.conv_dim = self.d_inner + 2 * n_groups * d_state
++
++        self.in_proj = nn.Linear(
++            hidden_size,
++            2 * self.d_inner + 2 * n_groups * d_state + num_heads,
++            bias=False,
++        )
++        self.conv1d = nn.Conv1d(
++            self.conv_dim, self.conv_dim, conv_kernel,
++            groups=self.conv_dim, padding=conv_kernel - 1, bias=True,
++        )
++        self.A_log = nn.Parameter(torch.log(torch.arange(1, num_heads + 1, dtype=torch.float32)))
++        self.D = nn.Parameter(torch.ones(num_heads))
++        self.dt_bias = nn.Parameter(torch.zeros(num_heads))
++        self.norm = _RMSNormGated(self.d_inner)
++        self.out_proj = nn.Linear(self.d_inner, hidden_size, bias=False)
++
++    def forward(
++        self, hidden_states: torch.Tensor, initial_states: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        b, L, _ = hidden_states.shape
++        gate, xBC, dt = torch.split(
++            self.in_proj(hidden_states),
++            [self.d_inner, self.conv_dim, self.num_heads],
++            dim=-1,
++        )
++        xBC = F.silu(self.conv1d(xBC.transpose(1, 2))[..., :L].transpose(1, 2))
++        x, B, C = torch.split(
++            xBC, [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state], dim=-1
++        )
++        x = x.reshape(b, L, self.num_heads, self.head_dim)
++        B = B.reshape(b, L, self.n_groups, self.d_state)
++        C = C.reshape(b, L, self.n_groups, self.d_state)
++        A = -torch.exp(self.A_log.float())
++
++        if _HAS_KERNEL and x.is_cuda:
++            y = mamba_chunk_scan_combined(
++                x, dt, A, B, C, chunk_size=L, D=self.D, dt_bias=self.dt_bias,
++                initial_states=initial_states, dt_softplus=True,
++            )
++        else:
++            _warn_if_gpu_without_kernel(x)
++            if initial_states is None:
++                initial_states = torch.zeros(
++                    b, self.num_heads, self.head_dim, self.d_state,
++                    dtype=torch.float32, device=hidden_states.device,
++                )
++            dt = F.softplus(dt.float() + self.dt_bias.float())
++            y = _ssd_reference(x.float(), dt, A, B.float(), C.float(), self.D.float(), initial_states.float())
++            y = y.to(hidden_states.dtype)
++
++        y = self.norm(y.reshape(b, L, self.d_inner), gate)
++        return self.out_proj(y)
+diff --git a/src/speculators/models/mamba_attn_hybrid/metrics.py b/src/speculators/models/mamba_attn_hybrid/metrics.py
+new file mode 100644
+index 0000000..9aee2ca
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/metrics.py
+@@ -0,0 +1,140 @@
++
++from functools import partial
++from typing import Any
++
++import torch
++from torch.nn.functional import binary_cross_entropy_with_logits
++
++from speculators.models.mamba_attn_hybrid.loss import (
++    LossConfig,
++    ce_loss,
++    compute_accuracy_multi_step,
++    dflash_loss_decay,
++    dpace_loss_weight,
++    loss_function,
++)
++
++
++def compute_metrics(
++    logits: torch.Tensor,
++    targets: torch.Tensor,
++    loss_mask: torch.Tensor,
++    block_size: int = 1,
++    gamma: float = 4.0,
++    parallel_drafting_loss_weight: str = "dflash",
++    dpace_alpha: float = 0.5,
++    confidence_logits: torch.Tensor | None = None,
++    confidence_head_alpha: float = 1.0,
++    loss_config: LossConfig | None = None,
++) -> tuple[torch.Tensor, dict]:
++    seq_len = logits.shape[1]
++    pos_idx = torch.arange(seq_len, device=logits.device) % block_size
++    pos_idx = pos_idx.unsqueeze(0)
++    decay_mult = None
++
++    if loss_config is None:
++        loss_config = {"ce": (ce_loss, 1.0)}
++
++    ce_is_loss_term = "ce" in loss_config
++    if ce_is_loss_term:
++        ce_elementwise = ce_loss(logits, targets)
++    elif parallel_drafting_loss_weight == "dpace":
++        with torch.no_grad():
++            ce_elementwise = ce_loss(logits, targets)
++    else:
++        ce_elementwise = None
++
++    if parallel_drafting_loss_weight == "dflash":
++        decay_fn = partial(dflash_loss_decay, gamma=gamma)
++    elif parallel_drafting_loss_weight == "dpace":
++        decay_mult = dpace_loss_weight(
++            ce_elementwise, loss_mask, block_size, alpha=dpace_alpha
++        )
++        decay_fn = None
++    else:
++        raise ValueError(
++            "Unknown parallel_drafting_loss_weight="
++            f"{parallel_drafting_loss_weight!r}; expected 'dflash' or 'dpace'."
++        )
++
++    loss = None
++    term_losses: dict[str, torch.Tensor] = {}
++    multi = len(loss_config) > 1
++    for name, (fn, weight) in loss_config.items():
++        term_elementwise = ce_elementwise if name == "ce" else fn(logits, targets)
++        term = loss_function(
++            logits,
++            targets,
++            loss_mask,
++            pos_idx,
++            decay_fn=decay_fn,
++            decay_mult=decay_mult,
++            elementwise_loss=term_elementwise,
++        )
++        if multi:
++            term_losses[name] = term.detach()
++        contribution = weight * term
++        loss = contribution if loss is None else loss + contribution
++
++    conf_loss = None
++    if confidence_logits is not None:
++        with torch.no_grad():
++            draft_p = torch.softmax(logits.float(), dim=-1)
++            target_p = torch.softmax(targets.float(), dim=-1)
++            accept_target = torch.minimum(draft_p, target_p).sum(dim=-1)
++        conf_bce = binary_cross_entropy_with_logits(
++            confidence_logits,
++            accept_target.to(confidence_logits.dtype),
++            reduction="none",
++        )
++        if decay_mult is not None:
++            conf_loss = loss_function(
++                logits,
++                targets,
++                loss_mask,
++                pos_idx,
++                decay_mult=decay_mult,
++                elementwise_loss=conf_bce,
++            )
++        else:
++            conf_loss = loss_function(
++                logits,
++                targets,
++                loss_mask,
++                pos_idx,
++                elementwise_loss=conf_bce,
++                decay_fn=partial(dflash_loss_decay, gamma=gamma),
++            )
++        loss = loss + confidence_head_alpha * conf_loss
++
++    pred_ids = torch.argmax(logits, dim=-1)
++    target_ids = torch.argmax(targets, dim=-1)
++
++    correct_per_pos, total_per_pos = compute_accuracy_multi_step(
++        pred_ids, target_ids, loss_mask, pos_idx, block_size
++    )
++
++    metrics: dict[str, Any] = {}
++    metrics["loss_sum"] = loss.detach().clone()
++    metrics["loss_total"] = torch.tensor(1.0, device=logits.device)
++    metrics["full_acc_sum"] = correct_per_pos[1:].sum()
++    metrics["full_acc_total"] = total_per_pos[1:].sum()
++
++    eal = torch.zeros((), device=logits.device)
++    cum = torch.ones((), device=logits.device)
++    for pos in range(1, block_size):
++        metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
++        metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
++        acc = correct_per_pos[pos] / total_per_pos[pos].clamp(min=1.0)
++        cum = cum * acc
++        eal = eal + cum
++    metrics["eal_sum"] = eal
++    metrics["eal_total"] = torch.tensor(1.0, device=logits.device)
++
++    if conf_loss is not None:
++        metrics["confidence_loss_sum"] = conf_loss.detach().clone()
++        metrics["confidence_loss_total"] = torch.tensor(1.0, device=logits.device)
++    for name, term_val in term_losses.items():
++        metrics[f"{name}_loss_sum"] = term_val
++        metrics[f"{name}_loss_total"] = torch.tensor(1.0, device=logits.device)
++    return loss, metrics
+diff --git a/src/speculators/models/mamba_attn_hybrid/model_definitions.py b/src/speculators/models/mamba_attn_hybrid/model_definitions.py
+new file mode 100644
+index 0000000..ebf41fc
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/model_definitions.py
+@@ -0,0 +1,101 @@
++import torch
++from torch import nn
++from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
++
++from speculators.models.mamba_attn_hybrid.attention_layer import (
++    Qwen3DFlashAttention,
++)
++
++from speculators.models.mamba_attn_hybrid.mamba import MambaDraftMixer
++
++
++class HybridMambaSubLayer(nn.Module):
++    def __init__(
++        self,
++        config,
++        *,
++        d_state: int = 16,
++        num_heads: int = 64,
++        head_dim: int = 64,
++        n_groups: int = 1,
++        conv_kernel: int = 4,
++        expand: int = 1,
++        num_anchors: int = 0,
++    ) -> None:
++        super().__init__()
++        self.ssm = MambaDraftMixer(
++            hidden_size=config.hidden_size,
++            d_state=d_state,
++            num_heads=num_heads,
++            head_dim=head_dim,
++            n_groups=n_groups,
++            conv_kernel=conv_kernel,
++            expand=expand,
++        )
++        self.ssm_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.num_anchors = num_anchors
++
++    @torch.compiler.disable
++    def _run_ssm(
++        self, h: torch.Tensor, ssm_state0: torch.Tensor | None
++    ) -> torch.Tensor:
++        return self.ssm(self.ssm_norm(h), initial_states=ssm_state0)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        ssm_state0: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        bsz, AK, d = hidden_states.shape
++        A = self.num_anchors
++        K = AK // A
++        h = hidden_states.reshape(A, K, d)
++        h = h + self._run_ssm(h, ssm_state0)
++        return h.reshape(1, AK, d)
++
++
++class HybridAttnSubLayer(nn.Module):
++    def __init__(
++        self,
++        config,
++        layer_idx: int,
++    ) -> None:
++        super().__init__()
++        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
++        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        context_kv: tuple[torch.Tensor, torch.Tensor],
++        attention_mask=None,
++        position_ids: torch.LongTensor | None = None,
++        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
++        use_cache: bool | None = False,
++        **kwargs,
++    ) -> torch.Tensor:
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states)
++        hidden_states = self.self_attn(
++            hidden_states=hidden_states,
++            context_kv=context_kv,
++            attention_mask=attention_mask,
++            position_ids=position_ids,
++            use_cache=use_cache,
++            position_embeddings=position_embeddings,
++            **kwargs,
++        )[0]
++        return residual + hidden_states
++
++
++class HybridMLPSubLayer(nn.Module):
++    def __init__(
++        self,
++        config,
++    ) -> None:
++        super().__init__()
++        self.mlp_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.mlp = Qwen3MLP(config)
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
+diff --git a/src/speculators/models/mamba_attn_hybrid/utils.py b/src/speculators/models/mamba_attn_hybrid/utils.py
+new file mode 100644
+index 0000000..922d408
+--- /dev/null
++++ b/src/speculators/models/mamba_attn_hybrid/utils.py
+@@ -0,0 +1,54 @@
++
++import torch
++
++
++def get_base_indices_for_anchored_blocks(
++    anchor_positions: torch.Tensor,
++    block_size: int,
++    total_seq_len: int | None = None,
++) -> torch.Tensor:
++    anchor_positions = anchor_positions.to(dtype=torch.long).view(-1)
++
++    offsets = torch.arange(block_size, device=anchor_positions.device, dtype=torch.long)
++    idx = (
++        anchor_positions[:, None] + offsets[None, :]
++    )
++
++    if (idx < 0).any() or (total_seq_len and (idx >= total_seq_len).any()):
++        raise ValueError(
++            "Some anchor_positions + offsets are out of range for total_seq_len"
++            f"={total_seq_len}. Max={idx.max().item()}, min={idx.min().item()}"
++        )
++
++    return idx.reshape(-1)
++
++
++def select_anchors(
++    loss_mask: torch.Tensor,
++    num_anchors: int,
++    block_size: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if loss_mask.ndim != 2:  # noqa: PLR2004
++        raise ValueError(f"Expected [B, T], got {loss_mask.shape}")
++
++    if block_size <= 0:
++        raise ValueError(f"Expected block size > 0, got {block_size}")
++
++    valid_mask = loss_mask.bool().clone()
++    valid_mask[:, -block_size:] = False
++
++    valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
++        -1
++    )
++
++    device = loss_mask.device
++    anchors = torch.zeros(num_anchors, dtype=torch.long, device=device)
++    anchor_valid = torch.zeros(num_anchors, dtype=torch.bool, device=device)
++
++    k = min(num_anchors, valid_indices.numel())
++    if k > 0:
++        perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
++        anchors[:k] = torch.sort(valid_indices[perm[:k]]).values
++        anchor_valid[:k] = True
++
++    return anchors, anchor_valid
+diff --git a/src/speculators/train/data.py b/src/speculators/train/data.py
+index c9775ac..14b1f09 100644
+--- a/src/speculators/train/data.py
++++ b/src/speculators/train/data.py
+@@ -93,6 +93,29 @@ def create_empty_sample(
+     }
+ 
+ 
++def create_empty_nkv_mamba_sample(
++    hidden_size: int,
++    num_fusion_layers: int,
++    num_target_layers: int,
++    num_kv_heads: int,
++    head_dim: int,
++    dtype: torch.dtype = torch.bfloat16,
++):
++    return {
++        "kv_caches": torch.empty(
++            0, num_target_layers, 2, num_kv_heads, head_dim, dtype=dtype
++        ),
++        "verifier_hidden_states": torch.empty(
++            0, num_fusion_layers * hidden_size, dtype=dtype
++        ),
++        "verifier_last_hidden_states": torch.empty(0, hidden_size, dtype=dtype),
++        "input_ids": torch.empty(0, dtype=torch.long),
++        "loss_mask": torch.empty(0, dtype=torch.bool),
++        "lengths": torch.tensor([0], dtype=torch.long),
++        "position_ids": torch.arange(0, dtype=torch.long),
++    }
++
++
+ def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
+     # v1 data format:
+     # {
+@@ -185,9 +208,10 @@ class BaseDataset(Dataset):
+         #  "loss_mask": [seq_len],
+         # }
+ 
+-        # Convert hidden states to the correct dtype
+         data = {
+-            k: v.to(self.hidden_states_dtype) if "hidden_states" in k else v
++            k: v.to(self.hidden_states_dtype)
++            if ("hidden_states" in k or k == "kv_caches")
++            else v
+             for k, v in data.items()
+         }
+ 
+@@ -241,6 +265,7 @@ class ArrowDataset(BaseDataset):
+         model: str | None = None,
+         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+         max_retries: int = DEFAULT_MAX_RETRIES,
++        data_format: Literal["hidden_states", "nkv_mamba"] = "hidden_states",
+     ):
+         """Initialize the ArrowDataset.
+         Args:
+@@ -279,6 +304,7 @@ class ArrowDataset(BaseDataset):
+         self.model = model
+         self.request_timeout = request_timeout
+         self.max_retries = max_retries
++        self.data_format = data_format
+ 
+         # Delay super init so that `_compute_approx_lengths` has required data
+         super().__init__(max_len, transform, hidden_states_dtype)
+@@ -386,6 +412,24 @@ class ArrowDataset(BaseDataset):
+             )
+             return None
+ 
++        if self.data_format == "nkv_mamba":
++            if "kv_caches" not in loaded_hs:
++                warnings.warn(
++                    f"nkv_mamba data format expected but no kv_caches key found "
++                    f"for sample {index}. Skipping.",
++                    stacklevel=1,
++                )
++                return None
++            kv_caches = loaded_hs["kv_caches"].permute(2, 0, 1, 3, 4)
++            hidden_states = loaded_hs["hidden_states"]
++            return {
++                "kv_caches": kv_caches,
++                "verifier_hidden_states": hidden_states[:, :-1].flatten(1),
++                "verifier_last_hidden_states": hidden_states[:, -1],
++                "input_ids": loaded_hs["token_ids"],
++                "loss_mask": self.data[index]["loss_mask"],
++            }
++
+         return {
+             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+                 1
+@@ -501,6 +545,7 @@ def create_collate_fn(
+     num_target_layers: int = 3,
+     dtype: torch.dtype = torch.bfloat16,
+     preprocess: Callable[[BatchType], BatchType] | None = None,
++    empty_sample_factory: Callable[[], BatchType] | None = None,
+ ):
+     def collate_fn(batch: list[BatchType | None]) -> BatchType:
+         # Apply per-sample preprocessing and filter failed samples
+@@ -512,7 +557,11 @@ def create_collate_fn(
+             # Match the configured `dtype` so the placeholder doesn't crash
+             # downstream layers loaded at a different precision (e.g. bf16
+             # weights vs fp32 default placeholders).
+-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
++            empty = (
++                empty_sample_factory()
++                if empty_sample_factory is not None
++                else create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
++            )
+             if preprocess:
+                 empty = preprocess(empty)
+             batch = [empty]
+diff --git a/src/speculators/train/dataloader.py b/src/speculators/train/dataloader.py
+index 299253b..09aa10a 100644
+--- a/src/speculators/train/dataloader.py
++++ b/src/speculators/train/dataloader.py
+@@ -36,6 +36,7 @@ def _setup_dataloader(
+     num_target_layers: int = 3,
+     prefetch_factor: int | None = 4,
+     preprocess: Callable[[BatchType], BatchType] | None = None,
++    empty_sample_factory: Callable[[], BatchType] | None = None,
+ ) -> DataLoader:
+     batch_sampler = MultipackDistributedBatchSamplerV2(
+         batch_max_length=total_seq_len,
+@@ -56,6 +57,7 @@ def _setup_dataloader(
+             num_target_layers=num_target_layers,
+             dtype=dataset.hidden_states_dtype,
+             preprocess=preprocess,
++            empty_sample_factory=empty_sample_factory,
+         ),
+         persistent_workers=use_workers,
+     )
+@@ -81,6 +83,9 @@ def create_train_val_loaders(
+     num_workers: int,
+     prefetch_factor: int,
+     preprocess: Callable[[BatchType], BatchType] | None,
++    data_format: Literal["hidden_states", "nkv_mamba"] = "hidden_states",
++    noise_tensors: tuple[str, ...] = ("hidden_states",),
++    empty_sample_factory: Callable[[], BatchType] | None = None,
+ ) -> tuple[DataLoader, DataLoader]:
+     """Create training and validation DataLoaders.
+ 
+@@ -89,7 +94,7 @@ def create_train_val_loaders(
+     batches via scatter).  Reads DP/SP topology from
+     :mod:`speculators.train.distributed`.
+     """
+-    noise_transform = AddUniformNoise(std=noise_std)
++    noise_transform = AddUniformNoise(std=noise_std, tensors=noise_tensors)
+ 
+     if not (0.0 < train_data_ratio < 1.0):
+         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
+@@ -126,6 +131,7 @@ def create_train_val_loaders(
+             hidden_states_dtype=hidden_states_dtype,
+             request_timeout=request_timeout,
+             max_retries=max_retries,
++            data_format=data_format,
+         )
+         val_dataset = ArrowDataset(
+             datapath=data_path,
+@@ -139,6 +145,7 @@ def create_train_val_loaders(
+             hidden_states_dtype=hidden_states_dtype,
+             request_timeout=request_timeout,
+             max_retries=max_retries,
++            data_format=data_format,
+         )
+ 
+     train_loader = _setup_dataloader(
+@@ -149,6 +156,7 @@ def create_train_val_loaders(
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
+         preprocess=preprocess,
++        empty_sample_factory=empty_sample_factory,
+     )
+     val_loader = _setup_dataloader(
+         val_dataset,
+@@ -158,6 +166,7 @@ def create_train_val_loaders(
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
+         preprocess=preprocess,
++        empty_sample_factory=empty_sample_factory,
+     )
+ 
+     return train_loader, val_loader

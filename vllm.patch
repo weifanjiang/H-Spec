@@ -1,0 +1,2500 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2e01263..5fc29f7 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -56,7 +56,13 @@ MTPModelTypes = Literal[
+     "gemma4_mtp",
+ ]
+ NgramGPUTypes = Literal["ngram_gpu"]
+-DFlashModelTypes = Literal["dflash"]
++DFlashModelTypes = Literal[
++    "dflash",
++    "mamba_attn_hybrid",
++]
++_DFLASH_ARCH_TO_METHOD: dict[str, str] = {
++    "MambaAttnHybridDraftModel": "mamba_attn_hybrid",
++}
+ DSparkModelTypes = Literal["dspark"]
+ EagleModelTypes = Literal[
+     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+@@ -142,6 +148,14 @@ class SpeculativeConfig:
+     O(2 * tp_size) per token. Only applies to greedy draft selection in
+     non-tree speculation."""
+ 
++    enable_kv_sharing: bool = False
++    """Share KV cache between draft and target models. Each draft attention
++    sub-layer reads from its mapped verifier layer's KV cache instead of
++    maintaining its own, so the draft allocates no KV storage of its own.
++    For mamba_attn_hybrid the mapping follows attn_kv_layer_ids
++    (non-sequential). Requires draft and target to have the same number of
++    KV heads and head size."""
++
+     use_heterogeneous_vocab: bool = False
+     """Allow draft and target models to use different vocabularies.
+     When enabled, builds a token-level intersection at init and constrains
+@@ -303,6 +317,7 @@ class SpeculativeConfig:
+             "extract_hidden_states",
+             "dflash",
+             "dspark",
++            "mamba_attn_hybrid",
+         )
+         factors.append(uses_aux_hidden_states)
+ 
+@@ -832,7 +847,13 @@ class SpeculativeConfig:
+                         draft_hf.truncated_vocab_size = target_vocab
+ 
+                 # Automatically detect the method
+-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
++                if self.method in (
++                    "eagle",
++                    "eagle3",
++                    "dflash",
++                    "dspark",
++                    "mamba_attn_hybrid",
++                ):
+                     pass
+                 # examples:
+                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
+@@ -843,6 +864,13 @@ class SpeculativeConfig:
+                     self.method = "eagle"
+                 elif "eagle3" in self.draft_model_config.model.lower():
+                     self.method = "eagle3"
++                elif (
++                    self.draft_model_config.hf_config.architectures[0]
++                    in _DFLASH_ARCH_TO_METHOD
++                ):
++                    self.method = _DFLASH_ARCH_TO_METHOD[
++                        self.draft_model_config.hf_config.architectures[0]
++                    ]
+                 elif "dflash" in self.draft_model_config.model.lower():
+                     self.method = "dflash"
+                 elif (
+@@ -907,7 +935,9 @@ class SpeculativeConfig:
+                     ]
+                     self.update_arch_()
+ 
+-                if self.method in ("dflash", "dspark"):
++                if self.method in ("dflash", "dspark") or self.method in get_args(
++                    DFlashModelTypes
++                ):
+                     self.parallel_drafting = True
+ 
+                 if self.num_speculative_tokens is not None and hasattr(
+@@ -1239,7 +1269,9 @@ class SpeculativeConfig:
+         # NOTE: This method is usually a stand-in for "speculative decoding using
+         # target model hidden states"
+         # TODO(ben): Refactor this so the naming is clearer
+-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
++        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark") or (
++            self.method in get_args(DFlashModelTypes)
++        )
+ 
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+@@ -1247,6 +1279,12 @@ class SpeculativeConfig:
+     def use_dspark(self) -> bool:
+         return self.method == "dspark"
+ 
++    def use_mamba_attn_hybrid(self) -> bool:
++        return self.method == "mamba_attn_hybrid"
++
++    def uses_infill_bonus_token(self) -> bool:
++        return self.method in get_args(DFlashModelTypes)
++
+     def uses_dynamic_speculative_decoding(self) -> bool:
+         return self.num_speculative_tokens_per_batch_size is not None
+ 
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index e8796a3..4320917 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2075,15 +2075,17 @@ class VllmConfig:
+                 "mtp",
+                 "dflash",
+                 "dspark",
++                "mamba_attn_hybrid",
+             ):
+                 unsupported.append(f"speculative method '{speculative_config.method}'")
+ 
+             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
+             # DFlash and DSpark use parallel drafting natively in V2 via their
+             # own speculators.
+-            if (
+-                speculative_config.parallel_drafting
+-                and speculative_config.method not in ("dflash", "dspark")
++            if speculative_config.parallel_drafting and speculative_config.method not in (
++                "dflash",
++                "dspark",
++                "mamba_attn_hybrid",
+             ):
+                 unsupported.append("parallel drafting for EAGLE speculative decoding")
+ 
+diff --git a/vllm/model_executor/models/qwen3_dflash_hybrid_blocks.py b/vllm/model_executor/models/qwen3_dflash_hybrid_blocks.py
+new file mode 100644
+index 0000000..8fdaeb7
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_dflash_hybrid_blocks.py
+@@ -0,0 +1,407 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++from transformers import Qwen3Config
++
++from vllm.config import CacheConfig, VllmConfig
++from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.logger import init_logger
++from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.linear import (
++    QKVParallelLinear,
++    RowParallelLinear,
++)
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.model_executor.layers.rotary_embedding import get_rope
++from vllm.v1.attention.backend import AttentionType
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheSpec,
++    SlidingWindowSpec,
++)
++
++from vllm.model_executor.layers.mamba.ops.ssd_combined import (
++    mamba_chunk_scan_combined_varlen,
++)
++from vllm.utils.math_utils import next_power_of_2
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++
++_DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
++
++
++def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
++    layer_types = getattr(config, "layer_types", None)
++    if layer_types is None:
++        return ("full_attention",) * config.num_hidden_layers
++    if len(layer_types) != config.num_hidden_layers:
++        raise ValueError(
++            f"DFlash layer_types length {len(layer_types)} does not match "
++            f"num_hidden_layers {config.num_hidden_layers}."
++        )
++    invalid = set(layer_types) - _DFLASH_VALID_LAYER_TYPES
++    if invalid:
++        raise ValueError(f"Invalid DFlash layer_type(s): {sorted(invalid)}.")
++    if "sliding_attention" in layer_types and not getattr(
++        config, "sliding_window", None
++    ):
++        raise ValueError(
++            "DFlash sliding_attention layers require `sliding_window` in config."
++        )
++    return tuple(layer_types)
++
++
++class _RMSNormGated(nn.Module):
++    def __init__(self, dim: int, eps: float = 1e-5) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(dim))
++        self.eps = eps
++
++    def forward(
++        self, x: torch.Tensor, gate: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        input_dtype = x.dtype
++        x = x.float()
++        if gate is not None:
++            x = x * F.silu(gate.float())
++        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
++        return self.weight * x.to(input_dtype)
++
++
++def _ssd_reference(x, dt, A, B, C, D, initial_states):
++    b, L, h, p = x.shape
++    g, n = B.shape[2], B.shape[3]
++    rep = h // g
++    if g == 1:
++        B = B.expand(b, L, h, n)
++        C = C.expand(b, L, h, n)
++    else:
++        B = B.repeat_interleave(rep, dim=2)
++        C = C.repeat_interleave(rep, dim=2)
++    state = initial_states
++    ys = []
++    for t in range(L):
++        dA = torch.exp(dt[:, t] * A)
++        dBx = dt[:, t][..., None, None] * (x[:, t][..., None] * B[:, t][:, :, None, :])
++        state = dA[..., None, None] * state + dBx
++        y = (state * C[:, t][:, :, None, :]).sum(-1) + D[None, :, None] * x[:, t]
++        ys.append(y)
++    return torch.stack(ys, dim=1)
++
++
++def _dflash_hybrid_ssd_scan(
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    D: torch.Tensor,
++    dt_bias: torch.Tensor,
++    num_blocks: int,
++    initial_states: torch.Tensor | None = None,
++) -> torch.Tensor:
++    block_len = x.shape[0] // num_blocks
++    chunk_size = next_power_of_2(block_len)
++    cu_seqlens = (
++        torch.arange(num_blocks + 1, device=x.device, dtype=torch.int32) * block_len
++    )
++    seq_idx = torch.arange(num_blocks, device=x.device, dtype=torch.int32)
++    out = torch.empty_like(x)
++    mamba_chunk_scan_combined_varlen(
++        x,
++        dt,
++        A,
++        B,
++        C,
++        chunk_size=chunk_size,
++        cu_seqlens=cu_seqlens,
++        cu_chunk_seqlens=cu_seqlens,
++        last_chunk_indices=seq_idx,
++        seq_idx=seq_idx,
++        out=out,
++        D=D,
++        z=None,
++        dt_bias=dt_bias,
++        initial_states=initial_states,
++        dt_softplus=True,
++        state_dtype=torch.float32,
++    )
++    return out
++
++
++def _dflash_hybrid_ssd_scan_fake(
++    x: torch.Tensor,
++    dt: torch.Tensor,
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    D: torch.Tensor,
++    dt_bias: torch.Tensor,
++    num_blocks: int,
++    initial_states: torch.Tensor | None = None,
++) -> torch.Tensor:
++    return torch.empty_like(x)
++
++
++direct_register_custom_op(
++    op_name="dflash_hybrid_ssd_scan",
++    op_func=_dflash_hybrid_ssd_scan,
++    fake_impl=_dflash_hybrid_ssd_scan_fake,
++)
++
++
++def _read_ssd_reference_max_l(default: int = 16, cap: int = 64) -> int:
++    raw = os.environ.get("HYBRID_SSD_REFERENCE_MAX_L")
++    if raw is None:
++        return default
++    try:
++        value = int(raw)
++    except ValueError:
++        logger.warning(
++            "HYBRID_SSD_REFERENCE_MAX_L=%r is not an integer; using default %d.",
++            raw,
++            default,
++        )
++        return default
++    return max(0, min(value, cap))
++
++
++_SSD_REFERENCE_MAX_L = _read_ssd_reference_max_l()
++
++
++class MambaDraftMixer(nn.Module):
++    def __init__(
++        self,
++        hidden_size: int,
++        d_state: int,
++        num_heads: int,
++        head_dim: int,
++        n_groups: int,
++        conv_kernel: int,
++        expand: int,
++    ) -> None:
++        super().__init__()
++        self.hidden_size = hidden_size
++        self.d_inner = num_heads * head_dim
++        self.num_heads, self.head_dim = num_heads, head_dim
++        self.n_groups, self.d_state = n_groups, d_state
++        self.conv_kernel = conv_kernel
++        self.conv_dim = self.d_inner + 2 * n_groups * d_state
++
++        self.in_proj = nn.Linear(
++            hidden_size,
++            2 * self.d_inner + 2 * n_groups * d_state + num_heads,
++            bias=False,
++        )
++        self.conv1d = nn.Conv1d(
++            self.conv_dim, self.conv_dim, conv_kernel,
++            groups=self.conv_dim, padding=conv_kernel - 1, bias=True,
++        )
++        self.A_log = nn.Parameter(
++            torch.log(torch.arange(1, num_heads + 1, dtype=torch.float32))
++        )
++        self.D = nn.Parameter(torch.ones(num_heads))
++        self.dt_bias = nn.Parameter(torch.zeros(num_heads))
++        self.norm = _RMSNormGated(self.d_inner)
++        self.out_proj = nn.Linear(self.d_inner, hidden_size, bias=False)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        initial_states: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        b, L, _ = hidden_states.shape
++        gate, xBC, dt = torch.split(
++            self.in_proj(hidden_states),
++            [self.d_inner, self.conv_dim, self.num_heads],
++            dim=-1,
++        )
++        _kc = self.conv_kernel
++        _dtype = xBC.dtype
++        _w = self.conv1d.weight.squeeze(1).float()
++        _xpad = F.pad(xBC.float(), (0, 0, _kc - 1, 0))
++        _conv = self.conv1d.bias.float() + sum(
++            _w[:, k] * _xpad[:, k : k + L, :] for k in range(_kc)
++        )
++        xBC = F.silu(_conv.to(_dtype))
++        x, B, C = torch.split(
++            xBC,
++            [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state],
++            dim=-1,
++        )
++        A = -torch.exp(self.A_log.float())
++
++        if hidden_states.is_cuda and L > _SSD_REFERENCE_MAX_L:
++            T = b * L
++            y = torch.ops.vllm.dflash_hybrid_ssd_scan(
++                x.reshape(T, self.num_heads, self.head_dim),
++                dt.reshape(T, self.num_heads),
++                A,
++                B.reshape(T, self.n_groups, self.d_state),
++                C.reshape(T, self.n_groups, self.d_state),
++                self.D,
++                self.dt_bias,
++                b,
++                None if initial_states is None else initial_states.to(torch.float32),
++            )
++            y = y.reshape(b, L, self.d_inner)
++        else:
++            if initial_states is None:
++                initial_states = torch.zeros(
++                    b, self.num_heads, self.head_dim, self.d_state,
++                    dtype=torch.float32, device=hidden_states.device,
++                )
++            dt_r = F.softplus(dt.float() + self.dt_bias.float())
++            y = _ssd_reference(
++                x.reshape(b, L, self.num_heads, self.head_dim).float(),
++                dt_r,
++                A,
++                B.reshape(b, L, self.n_groups, self.d_state).float(),
++                C.reshape(b, L, self.n_groups, self.d_state).float(),
++                self.D.float(),
++                initial_states.float(),
++            )
++            y = y.to(hidden_states.dtype).reshape(b, L, self.d_inner)
++
++        y = self.norm(y, gate)
++        return self.out_proj(y)
++
++
++class DFlashAttention(Attention):
++
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++
++    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
++        spec = super().get_kv_cache_spec(vllm_config)
++        if isinstance(spec, SlidingWindowSpec):
++            return FullAttentionSpec(
++                block_size=spec.block_size,
++                num_kv_heads=spec.num_kv_heads,
++                head_size=spec.head_size,
++                head_size_v=getattr(spec, "head_size_v", spec.head_size),
++                dtype=spec.dtype,
++                kv_quant_mode=spec.kv_quant_mode,
++                page_size_padded=spec.page_size_padded,
++            )
++        return spec
++
++    def forward(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        output_shape: torch.Size | None = None,
++    ) -> torch.Tensor:
++        saved = self.kv_sharing_target_layer_name
++        self.kv_sharing_target_layer_name = None
++        result = super().forward(query, key, value, output_shape)
++        self.kv_sharing_target_layer_name = saved
++        return result
++
++
++class DFlashQwen3Attention(nn.Module):
++
++    def __init__(
++        self,
++        hidden_size: int,
++        num_heads: int,
++        num_kv_heads: int,
++        rope_parameters: dict,
++        max_position: int = 4096 * 32,
++        head_dim: int | None = None,
++        rms_norm_eps: float = 1e-06,
++        attention_bias: bool = False,
++        cache_config: CacheConfig | None = None,
++        quant_config: QuantizationConfig | None = None,
++        sliding_window: int | None = None,
++        qk_norm: bool = True,
++        prefix: str = "",
++        attn_type: str = AttentionType.DECODER,
++    ) -> None:
++        super().__init__()
++        self.layer_name = prefix
++        self.hidden_size = hidden_size
++        tp_size = get_tensor_model_parallel_world_size()
++        self.total_num_heads = num_heads
++        assert self.total_num_heads % tp_size == 0
++        self.num_heads = self.total_num_heads // tp_size
++        self.total_num_kv_heads = num_kv_heads
++        if self.total_num_kv_heads >= tp_size:
++            assert self.total_num_kv_heads % tp_size == 0
++        else:
++            assert tp_size % self.total_num_kv_heads == 0
++        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++        self.head_dim = head_dim or hidden_size // self.total_num_heads
++        self.q_size = self.num_heads * self.head_dim
++        self.kv_size = self.num_kv_heads * self.head_dim
++        self.scaling = self.head_dim**-0.5
++
++        self.qkv_proj = QKVParallelLinear(
++            hidden_size,
++            self.head_dim,
++            self.total_num_heads,
++            self.total_num_kv_heads,
++            bias=attention_bias,
++            quant_config=quant_config,
++            prefix=f"{prefix}.qkv_proj",
++        )
++        self.o_proj = RowParallelLinear(
++            self.total_num_heads * self.head_dim,
++            hidden_size,
++            bias=attention_bias,
++            quant_config=quant_config,
++            prefix=f"{prefix}.o_proj",
++        )
++
++        self.rotary_emb = get_rope(
++            self.head_dim,
++            max_position=max_position,
++            rope_parameters=rope_parameters,
++        )
++        self.attn = DFlashAttention(
++            self.num_heads,
++            self.head_dim,
++            self.scaling,
++            num_kv_heads=self.num_kv_heads,
++            cache_config=cache_config,
++            quant_config=quant_config,
++            per_layer_sliding_window=sliding_window,
++            prefix=f"{prefix}.attn",
++            attn_type=attn_type,
++        )
++        self.qk_norm = qk_norm
++        if qk_norm:
++            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
++            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
++        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++
++        if self.qk_norm:
++            q_shape, k_shape = q.shape, k.shape
++            q = self.q_norm(
++                q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
++            ).view(q_shape)
++            k = self.k_norm(
++                k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
++            ).view(k_shape)
++
++        q, k = self.rotary_emb(positions, q, k)
++
++        attn_output = self.attn(q, k, v)
++        output, _ = self.o_proj(attn_output)
++        return output
+diff --git a/vllm/model_executor/models/qwen3_dflash_mamba_attn_hybrid.py b/vllm/model_executor/models/qwen3_dflash_mamba_attn_hybrid.py
+new file mode 100644
+index 0000000..9b81c8b
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_dflash_mamba_attn_hybrid.py
+@@ -0,0 +1,660 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++from collections.abc import Iterable
++
++import torch
++from torch import nn
++from transformers import Qwen3Config
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
++from vllm.logger import init_logger
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import (
++    default_weight_loader,
++    maybe_remap_kv_scale_name,
++)
++from vllm.multimodal.inputs import NestedTensors
++from vllm.transformers_utils.config import set_default_rope_theta
++from vllm.v1.attention.backend import AttentionType
++
++from .qwen2 import Qwen2MLP as Qwen3MLP
++from .qwen3 import Qwen3ForCausalLM
++
++from .qwen3_dflash_hybrid_blocks import (
++    DFlashQwen3Attention,
++    MambaDraftMixer,
++    _get_dflash_layer_types,
++)
++from .utils import (
++    AutoWeightsLoader,
++    get_draft_quant_config,
++    maybe_prefix,
++    process_eagle_weight,
++)
++
++logger = init_logger(__name__)
++
++
++class HybridMambaSubLayer(nn.Module):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        *,
++        d_state: int = 16,
++        num_heads: int = 64,
++        head_dim: int = 64,
++        n_groups: int = 1,
++        conv_kernel: int = 4,
++        expand: int = 1,
++    ) -> None:
++        super().__init__()
++        self.ssm = MambaDraftMixer(
++            hidden_size=config.hidden_size,
++            d_state=d_state,
++            num_heads=num_heads,
++            head_dim=head_dim,
++            n_groups=n_groups,
++            conv_kernel=conv_kernel,
++            expand=expand,
++        )
++        self.ssm_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        num_reqs: int,
++        ssm_state0: torch.Tensor | None,
++    ) -> torch.Tensor:
++        AK, d = hidden_states.shape
++        K = AK // num_reqs
++        h = hidden_states.reshape(num_reqs, K, d)
++        h = h + self.ssm(self.ssm_norm(h), ssm_state0)
++        return h.reshape(AK, d)
++
++
++class HybridAttnSubLayer(nn.Module):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        *,
++        cache_config: CacheConfig | None = None,
++        quant_config: QuantizationConfig | None = None,
++        layer_type: str = "full_attention",
++        attn_rope_entry: dict | None = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        rope_parameters = (
++            attn_rope_entry["rope_parameters"]
++            if attn_rope_entry is not None
++            else config.rope_parameters
++        )
++        draft_window = (
++            config.sliding_window if layer_type == "sliding_attention" else None
++        )
++        verifier_window = (
++            attn_rope_entry["sliding_window"] if attn_rope_entry is not None else None
++        )
++        sliding_window = draft_window if draft_window is not None else verifier_window
++        self.layer_type = (
++            "sliding_attention" if sliding_window is not None else "full_attention"
++        )
++        self.self_attn = DFlashQwen3Attention(
++            hidden_size=config.hidden_size,
++            num_heads=config.num_attention_heads,
++            max_position=config.max_position_embeddings,
++            num_kv_heads=config.num_key_value_heads,
++            rms_norm_eps=config.rms_norm_eps,
++            attention_bias=getattr(config, "attention_bias", False),
++            head_dim=getattr(config, "head_dim", None),
++            cache_config=cache_config,
++            quant_config=quant_config,
++            sliding_window=sliding_window,
++            rope_parameters=rope_parameters,
++            qk_norm=getattr(config, "use_qk_norm", True),
++            prefix=f"{prefix}.self_attn",
++            attn_type=AttentionType.DECODER,
++        )
++        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states)
++        hidden_states = self.self_attn(
++            positions=positions,
++            hidden_states=hidden_states,
++        )
++        return residual + hidden_states
++
++
++class HybridMLPSubLayer(nn.Module):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        *,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.mlp = Qwen3MLP(
++            hidden_size=config.hidden_size,
++            intermediate_size=config.intermediate_size,
++            hidden_act=config.hidden_act,
++            quant_config=quant_config,
++            prefix=f"{prefix}.mlp",
++        )
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
++
++
++class DSparkMarkovHead(nn.Module):
++    def __init__(
++        self,
++        vocab_size: int,
++        draft_vocab_size: int,
++        markov_rank: int,
++        prefix: str,
++    ) -> None:
++        super().__init__()
++        self.markov_w1 = VocabParallelEmbedding(
++            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
++        )
++        self.markov_w2 = ParallelLMHead(
++            draft_vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
++        )
++
++    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
++        return self.markov_w1(token_ids)
++
++    def bias(self, markov_embed: torch.Tensor, logits_processor) -> torch.Tensor:
++        return logits_processor(self.markov_w2, markov_embed)
++
++
++@support_torch_compile
++class MambaAttnHybridQwen3Model(nn.Module):
++
++    def __init__(
++        self,
++        *,
++        vllm_config: VllmConfig,
++        start_layer_id: int = 0,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.config = vllm_config.speculative_config.draft_model_config.hf_config
++        self.vocab_size = self.config.vocab_size
++        self.quant_config = get_draft_quant_config(vllm_config)
++
++        drafter_config = getattr(self.config, "eagle_config", {})
++        drafter_config.update(getattr(self.config, "dflash_config", {}))
++
++        if drafter_config is not None and "use_aux_hidden_state" in drafter_config:
++            self.use_aux_hidden_state = drafter_config["use_aux_hidden_state"]
++        else:
++            self.use_aux_hidden_state = True
++
++        current_vllm_config = get_current_vllm_config()
++
++        if getattr(self.config, "attn_rope", None) is None:
++            set_default_rope_theta(self.config, default_theta=1000000)
++
++        self.embed_tokens = VocabParallelEmbedding(
++            self.config.vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
++
++        block_pattern = list(getattr(self.config, "block_pattern", None) or [])
++        if not block_pattern:
++            raise ValueError(
++                "Mamba-Attn-Hybrid requires a non-empty block_pattern in config."
++            )
++        self.block_pattern = block_pattern
++        attn_kv_layer_ids = list(getattr(self.config, "attn_kv_layer_ids", None) or [])
++        num_attn = block_pattern.count("attention")
++        num_mamba = block_pattern.count("mamba")
++        if len(attn_kv_layer_ids) != num_attn:
++            raise ValueError(
++                f"attn_kv_layer_ids has {len(attn_kv_layer_ids)} entries but "
++                f"block_pattern has {num_attn} attention sub-layer(s); must match."
++            )
++        self.attn_kv_layer_ids = attn_kv_layer_ids
++
++        self.attn_rope = getattr(self.config, "attn_rope", None)
++
++        if self.config.num_hidden_layers != num_attn:
++            raise ValueError(
++                f"num_hidden_layers ({self.config.num_hidden_layers}) must equal the "
++                f"number of attention sub-layers ({num_attn}); train.py derives "
++                "--num-layers from --block-pattern."
++            )
++        self.layer_types = _get_dflash_layer_types(self.config)
++
++        if getattr(self.config, "sliding_window_non_causal", False):
++            raise NotImplementedError(
++                "mamba_attn_hybrid inference does not support "
++                "sliding_window_non_causal; retrain without it or extend the "
++                "proposer's SWA attention metadata."
++            )
++        if getattr(self.config, "sliding_window_prefix", 0):
++            raise NotImplementedError(
++                "mamba_attn_hybrid inference does not support sliding_window_prefix "
++                "(attention sink); retrain without it or extend the attention mask."
++            )
++
++        self.mamba_d_state = getattr(self.config, "mamba_d_state", 16)
++        self.mamba_num_heads = getattr(self.config, "mamba_num_heads", 64)
++        self.mamba_head_dim = getattr(self.config, "mamba_head_dim", 64)
++        self.mamba_n_groups = getattr(self.config, "mamba_n_groups", 1)
++        self.mamba_conv_kernel = getattr(self.config, "mamba_conv_kernel", 4)
++        self.mamba_expand = getattr(self.config, "mamba_expand", 1)
++        self.mamba_seed_mode = getattr(self.config, "mamba_seed_mode", "per_layer")
++
++        self.block_size = 1 + vllm_config.speculative_config.num_speculative_tokens
++
++        layers: list[nn.Module] = []
++        self._sub_type: list[str] = []
++        self._sub_seed_idx: list[int] = []
++        attn_i = 0
++        mamba_i = 0
++        for flat_idx, tok in enumerate(block_pattern):
++            sub_prefix = maybe_prefix(prefix, f"layers.{flat_idx + start_layer_id}")
++            if tok == "mamba":
++                layers.append(
++                    HybridMambaSubLayer(
++                        self.config,
++                        d_state=self.mamba_d_state,
++                        num_heads=self.mamba_num_heads,
++                        head_dim=self.mamba_head_dim,
++                        n_groups=self.mamba_n_groups,
++                        conv_kernel=self.mamba_conv_kernel,
++                        expand=self.mamba_expand,
++                    )
++                )
++                self._sub_type.append("mamba")
++                if self.mamba_seed_mode == "per_layer":
++                    self._sub_seed_idx.append(mamba_i)
++                elif self.mamba_seed_mode == "shared":
++                    self._sub_seed_idx.append(0)
++                else:
++                    self._sub_seed_idx.append(0 if mamba_i == 0 else -1)
++                mamba_i += 1
++            elif tok == "attention":
++                attn_rope_entry = (
++                    self.attn_rope[attn_i] if self.attn_rope is not None else None
++                )
++                layers.append(
++                    HybridAttnSubLayer(
++                        self.config,
++                        cache_config=current_vllm_config.cache_config,
++                        quant_config=self.quant_config,
++                        layer_type=self.layer_types[attn_i],
++                        attn_rope_entry=attn_rope_entry,
++                        prefix=sub_prefix,
++                    )
++                )
++                self._sub_type.append("attention")
++                self._sub_seed_idx.append(-1)
++                attn_i += 1
++            else:
++                layers.append(
++                    HybridMLPSubLayer(
++                        self.config,
++                        quant_config=self.quant_config,
++                        prefix=sub_prefix,
++                    )
++                )
++                self._sub_type.append("mlp")
++                self._sub_seed_idx.append(-1)
++        self.layers = nn.ModuleList(layers)
++
++        self.attn_sublayers: list[HybridAttnSubLayer] = [
++            layer
++            for layer, t in zip(self.layers, self._sub_type)
++            if t == "attention"
++        ]
++        self.sliding_attention_layer_names = {
++            sub.self_attn.attn.layer_name
++            for sub in self.attn_sublayers
++            if sub.layer_type == "sliding_attention"
++        }
++
++        latent_fusion_layer_ids = getattr(
++            self.config, "latent_fusion_layer_ids", None
++        )
++        if latent_fusion_layer_ids is None:
++            latent_fusion_layer_ids = getattr(
++                self.config, "eagle_aux_hidden_state_layer_ids", None
++            )
++        if latent_fusion_layer_ids is None:
++            raise ValueError(
++                "Mamba-Attn-Hybrid requires latent_fusion_layer_ids (or "
++                "eagle_aux_hidden_state_layer_ids) to size the fc projection."
++            )
++        self.num_fusion_layers = len(latent_fusion_layer_ids)
++        self.fc = nn.Linear(
++            self.num_fusion_layers * self.config.hidden_size,
++            self.config.hidden_size,
++            bias=False,
++        )
++        self.hidden_norm = RMSNorm(
++            self.config.hidden_size,
++            eps=self.config.rms_norm_eps,
++        )
++        self.fc_norm = (
++            nn.ModuleList(
++                [
++                    RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
++                    for _ in range(self.num_fusion_layers)
++                ]
++            )
++            if getattr(self.config, "fc_norm", False)
++            else None
++        )
++
++        seed_out = self.mamba_num_heads * self.mamba_head_dim * self.mamba_d_state
++        num_seed_projs = num_mamba if self.mamba_seed_mode == "per_layer" else 1
++        self.seed_projs = nn.ModuleList(
++            [
++                nn.Linear(self.config.hidden_size, seed_out, bias=False)
++                for _ in range(num_seed_projs)
++            ]
++        )
++
++        self.norm = RMSNorm(
++            self.config.hidden_size,
++            eps=self.config.rms_norm_eps,
++        )
++
++        markov_rank = getattr(self.config, "markov_rank", 0) or 0
++        if markov_rank > 0:
++            markov_head_type = getattr(self.config, "markov_head_type", "vanilla")
++            if markov_head_type != "vanilla":
++                raise ValueError(
++                    "DSpark mamba_attn_hybrid inference supports only "
++                    f"markov_head_type='vanilla', got {markov_head_type!r}."
++                )
++            draft_vocab_size = (
++                getattr(self.config, "draft_vocab_size", None) or self.config.vocab_size
++            )
++            self.markov_head: DSparkMarkovHead | None = DSparkMarkovHead(
++                self.config.vocab_size,
++                draft_vocab_size,
++                markov_rank,
++                prefix=maybe_prefix(prefix, "markov_head"),
++            )
++        else:
++            self.markov_head = None
++
++        logger.info(
++            "Mamba-Attn-Hybrid: recipe %s | %d attention sub-layers <- verifier KV %s "
++            "| F=%d fusion | seed_mode=%s",
++            " ".join(block_pattern),
++            num_attn,
++            list(attn_kv_layer_ids),
++            self.num_fusion_layers,
++            self.mamba_seed_mode,
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def precompute_and_store_context_kv(
++        self,
++        context_states: torch.Tensor,
++        context_positions: torch.Tensor,
++        context_slot_mapping: torch.Tensor | None = None,
++    ) -> None:
++        pass
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        input_embeds: torch.Tensor | None = None,
++        latent_seed: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if input_embeds is None:
++            input_embeds = self.embed_input_ids(input_ids)
++
++        hidden_states = input_embeds
++
++        assert latent_seed is not None, (
++            "MambaAttnHybridQwen3Model.forward requires latent_seed to be passed "
++            "by the proposer (as a forward argument, not an attribute)."
++        )
++        num_reqs = hidden_states.shape[0] // self.block_size
++        latent = latent_seed[:num_reqs]
++        if self.fc_norm is not None:
++            chunks = latent.chunk(len(self.fc_norm), dim=-1)
++            latent = torch.cat(
++                [norm(c) for norm, c in zip(self.fc_norm, chunks, strict=True)], dim=-1
++            )
++        z = self.hidden_norm(self.fc(latent))
++
++        seed_states = [
++            proj(z).view(
++                num_reqs,
++                self.mamba_num_heads,
++                self.mamba_head_dim,
++                self.mamba_d_state,
++            )
++            for proj in self.seed_projs
++        ]
++        if self.mamba_seed_mode != "per_layer":
++            seed_states = [s.float() for s in seed_states]
++
++        for i, layer in enumerate(self.layers):
++            t = self._sub_type[i]
++            if t == "mamba":
++                seed_idx = self._sub_seed_idx[i]
++                ssm_state0 = seed_states[seed_idx] if seed_idx >= 0 else None
++                hidden_states = layer(hidden_states, num_reqs, ssm_state0)
++            elif t == "attention":
++                hidden_states = layer(positions, hidden_states)
++            else:
++                hidden_states = layer(hidden_states)
++
++        hidden_states = self.norm(hidden_states)
++        return hidden_states
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            (".qkv_proj", ".q_proj", "q"),
++            (".qkv_proj", ".k_proj", "k"),
++            (".qkv_proj", ".v_proj", "v"),
++            (".gate_up_proj", ".gate_proj", 0),
++            (".gate_up_proj", ".up_proj", 1),
++        ]
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++        for name, loaded_weight in weights:
++            if "midlayer." in name:
++                name = name.replace("midlayer.", "layers.0.")
++            if self.quant_config is not None and (
++                scale_name := self.quant_config.get_cache_scale(name)
++            ):
++                param = params_dict[scale_name]
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                loaded_weight = (
++                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
++                )
++                weight_loader(param, loaded_weight)
++                loaded_params.add(scale_name)
++                continue
++            if "scale" in name:
++                name = maybe_remap_kv_scale_name(name, params_dict)
++                if name is None:
++                    continue
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if weight_name not in name:
++                    continue
++                name = name.replace(weight_name, param_name)
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                param = params_dict[name]
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++        return loaded_params
++
++
++class MambaAttnHybridQwen3ForCausalLM(Qwen3ForCausalLM):
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        nn.Module.__init__(self)
++        self.config = vllm_config.speculative_config.draft_model_config.hf_config
++        if getattr(self.config, "draft_vocab_size", None) is None:
++            self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
++        target_layer_num = vllm_config.model_config.get_num_layers(
++            vllm_config.parallel_config
++        )
++        self.config.target_layer_count = target_layer_num
++        self.model = MambaAttnHybridQwen3Model(
++            vllm_config=vllm_config,
++            prefix=maybe_prefix(prefix, "model"),
++            start_layer_id=target_layer_num,
++        )
++
++        logit_scale = getattr(self.config, "logit_scale", 1.0)
++        self.lm_head = ParallelLMHead(
++            self.config.draft_vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
++        )
++        self.logits_processor = LogitsProcessor(
++            self.config.draft_vocab_size, scale=logit_scale
++        )
++        target_vocab_size = vllm_config.model_config.get_vocab_size()
++        if self.config.draft_vocab_size != target_vocab_size:
++            self.draft_id_to_target_id = nn.Parameter(
++                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
++                requires_grad=False,
++            )
++        else:
++            self.draft_id_to_target_id = None
++
++    def embed_input_ids(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: NestedTensors | None = None,
++        is_multimodal: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++        latent_seed: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return self.model(input_ids, positions, inputs_embeds, latent_seed)
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor | None:
++        logits = self.compute_draft_logits(hidden_states)
++        if self.draft_id_to_target_id is None:
++            return logits
++
++        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
++        targets = base + self.draft_id_to_target_id
++        logits_new = logits.new_full(
++            (logits.shape[0], self.config.vocab_size),
++            float("-inf"),
++        )
++        logits_new[:, targets] = logits
++        return logits_new
++
++    @property
++    def has_markov_head(self) -> bool:
++        return self.model.markov_head is not None
++
++    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
++        if self.draft_id_to_target_id is None:
++            return draft_ids
++        return draft_ids + self.draft_id_to_target_id[draft_ids]
++
++    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.embed(token_ids)
++
++    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.bias(markov_embed, self.logits_processor)
++
++    def precompute_and_store_context_kv(
++        self,
++        context_states: torch.Tensor,
++        context_positions: torch.Tensor,
++        context_slot_mapping: torch.Tensor | None = None,
++    ) -> None:
++        self.model.precompute_and_store_context_kv(
++            context_states, context_positions, context_slot_mapping
++        )
++
++    @property
++    def sliding_attention_layer_names(self) -> set[str]:
++        return self.model.sliding_attention_layer_names
++
++    def combine_hidden_states(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        return hidden_states
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
++        model_weights = {}
++        includes_draft_id_mapping = False
++        includes_embed_tokens = False
++        for name, loaded_weight in weights:
++            assert "mask_hidden" not in name, (
++                "DFlash should use mask_token_id to embed the padding hidden state"
++            )
++            if "t2d" in name:
++                continue
++            if "d2t" in name:
++                name = name.replace("d2t", "draft_id_to_target_id")
++                includes_draft_id_mapping = True
++            elif "lm_head" not in name:
++                name = "model." + name
++            if "embed_tokens" in name:
++                includes_embed_tokens = True
++            model_weights[name] = loaded_weight
++            process_eagle_weight(self, name)
++
++        skip_substrs = ["mask_embedding", "confidence_head"]
++        if not includes_draft_id_mapping:
++            skip_substrs.append("draft_id_to_target_id")
++        if not includes_embed_tokens:
++            skip_substrs.append("embed_tokens")
++        skip_substrs.append("verifier_lm_head")
++        skip_substrs.append("verifier_norm")
++
++        loader = AutoWeightsLoader(
++            self,
++            skip_prefixes=None,
++            skip_substrs=skip_substrs,
++        )
++        loader.load_weights(model_weights.items())
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index c9e43ed..79113df 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -593,6 +593,10 @@ _SPECULATIVE_DECODING_MODELS = {
+     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
+     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
++    "MambaAttnHybridDraftModel": (
++        "qwen3_dflash_mamba_attn_hybrid",
++        "MambaAttnHybridQwen3ForCausalLM",
++    ),
+     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
+     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+     "DFlashLagunaForCausalLM": ("laguna_dflash", "DFlashLagunaForCausalLM"),
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index bafb48e..4a213cd 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -644,6 +644,11 @@ def maybe_override_with_speculators(
+     # Set the draft model to the speculators model
+     speculative_config["model"] = model
+ 
++    if vllm_speculative_config and speculative_config.get("method") == (
++        "mamba_attn_hybrid"
++    ):
++        speculative_config.update(vllm_speculative_config)
++
+     # Override model and tokenizer with the verifier model from config
+     verifier_model = speculators_config["verifier"]["name_or_path"]
+     model = tokenizer = verifier_model
+diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
+index f4b0f73..3659af2 100644
+--- a/vllm/transformers_utils/configs/speculators/algos.py
++++ b/vllm/transformers_utils/configs/speculators/algos.py
+@@ -164,3 +164,76 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
+     ):
+         if config_dict.get(key) is not None:
+             pre_trained_config[key] = config_dict[key]
++
++
++@register_speculator("mamba_attn_hybrid")
++def update_mamba_attn_hybrid(config_dict: dict, pre_trained_config: dict) -> None:
++    """
++    Apply Mamba-Attn-Hybrid config transformations.
++
++    Like DFlash-Mamba2Mix (standard Mamba-2 / SSD mixer + per-layer latent seed),
++    but the architecture is a FLEXIBLE recipe (``block_pattern``) and the attention
++    sub-layers map to verifier KV layers via ``attn_kv_layer_ids`` (the sole
++    verifier-KV source), DECOUPLED from the latent-fusion set. Two consequences for
++    the config translation:
++
++    - The verifier must capture hidden states for the FUSION layers (the latent
++      seed), so ``eagle_aux_hidden_state_layer_ids`` is set to
++      ``latent_fusion_layer_ids`` — NOT the KV set. (In DFlash-Mamba2Mix they
++      coincide, so it used ``aux_hidden_state_layer_ids``.)
++    - KV sharing is driven by ``attn_kv_layer_ids`` in the proposer; those reference
++      verifier layers directly (the verifier KV cache exists for every layer), so an
++      attn KV layer need not be in the fusion set.
++
++    The mamba-specific fields below are read at top level by
++    MambaAttnHybridQwen3Model.__init__; ``block_pattern`` / ``attn_kv_layer_ids`` are
++    read by both the model and the proposer.
++    """
++    pre_trained_config["architectures"] = ["MambaAttnHybridDraftModel"]
++    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
++    if config_dict.get("target_hidden_size") is not None:
++        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
++
++    latent_fusion_layer_ids = config_dict.get("latent_fusion_layer_ids")
++    if latent_fusion_layer_ids is None:
++        latent_fusion_layer_ids = config_dict["aux_hidden_state_layer_ids"]
++    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = latent_fusion_layer_ids
++    pre_trained_config["latent_fusion_layer_ids"] = latent_fusion_layer_ids
++
++    pre_trained_config["dflash_config"] = {
++        "mask_token_id": config_dict["mask_token_id"],
++        "target_layer_ids": [i - 1 for i in latent_fusion_layer_ids],
++    }
++
++    pre_trained_config["block_pattern"] = config_dict["block_pattern"]
++    pre_trained_config["attn_kv_layer_ids"] = config_dict["attn_kv_layer_ids"]
++
++    pre_trained_config["attn_rope"] = config_dict.get("attn_rope")
++
++    pre_trained_config["use_qk_norm"] = config_dict.get("use_qk_norm", True)
++
++    if config_dict.get("sliding_window_non_causal") is not None:
++        pre_trained_config["sliding_window_non_causal"] = config_dict[
++            "sliding_window_non_causal"
++        ]
++    if config_dict.get("sliding_window_prefix") is not None:
++        pre_trained_config["sliding_window_prefix"] = config_dict[
++            "sliding_window_prefix"
++        ]
++
++    pre_trained_config["mamba_d_state"] = config_dict.get("mamba_d_state", 16)
++    pre_trained_config["mamba_num_heads"] = config_dict.get("mamba_num_heads", 64)
++    pre_trained_config["mamba_head_dim"] = config_dict.get("mamba_head_dim", 64)
++    pre_trained_config["mamba_n_groups"] = config_dict.get("mamba_n_groups", 1)
++    pre_trained_config["mamba_conv_kernel"] = config_dict.get("mamba_conv_kernel", 4)
++    pre_trained_config["mamba_expand"] = config_dict.get("mamba_expand", 1)
++    pre_trained_config["mamba_seed_mode"] = config_dict.get(
++        "mamba_seed_mode", "per_layer"
++    )
++
++    for key in ("markov_rank", "markov_head_type"):
++        if config_dict.get(key) is not None:
++            pre_trained_config[key] = config_dict[key]
++
++    if config_dict.get("fc_norm") is not None:
++        pre_trained_config["fc_norm"] = config_dict["fc_norm"]
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index db5b0dd..6ae4aa0 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -870,11 +870,16 @@ class FlashAttentionImpl(AttentionImpl):
+                 )
+                 return output
+             else:
+-                window = (
+-                    attn_metadata.sliding_window
+-                    if attn_metadata.sliding_window is not None
+-                    else self.sliding_window
+-                )
++                window = attn_metadata.sliding_window
++                if window is None:
++                    window = self.sliding_window
++                elif (
++                    tuple(window) == (-1, -1)
++                    and tuple(self.sliding_window) != (-1, -1)
++                ):
++                    window = _maybe_symmetrize_window(
++                        self.sliding_window, attn_metadata.causal
++                    )
+                 sliding_window_size: list[int] | None = (
+                     list(window) if window is not None else None
+                 )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8e01035..e994505 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -245,16 +245,13 @@ class Scheduler(SchedulerInterface):
+                 self.num_lookahead_tokens = self.num_spec_tokens
+             if speculative_config.uses_draft_model():
+                 self.num_lookahead_tokens = self.num_spec_tokens
+-            if speculative_config.use_dflash():
++            if speculative_config.uses_infill_bonus_token():
+                 # DFlash requires an extra lookahead slot since it uses in-fill-style
+                 # decoding instead of standard next-token sampling, so it has a query
+                 # for the last sampled token plus queries for each draft token.
+                 self.num_lookahead_tokens = self.num_spec_tokens + 1
+             if speculative_config.use_dspark():
+-                # DSpark drafts a block of num_spec_tokens query tokens in which the
+-                # anchor itself is the first prediction position (no separate bonus
+-                # query), so it needs exactly num_spec_tokens lookahead slots.
+-                self.num_lookahead_tokens = self.num_spec_tokens
++                self.num_lookahead_tokens = self.num_spec_tokens + 1
+ 
+         # Create the KV cache manager.
+         if hash_block_size is None:
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 756c5f3..e6af905 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -31,6 +31,9 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
+ from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
+ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+ from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
++from vllm.model_executor.models.qwen3_dflash_mamba_attn_hybrid import (
++    MambaAttnHybridQwen3ForCausalLM,
++)
+ from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.platforms import current_platform
+@@ -111,7 +114,12 @@ class SpecDecodeBaseProposer:
+             1 if not self.parallel_drafting else self.num_speculative_tokens
+         )
+         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
+-            1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
++            1
++            if (
++                self.pass_hidden_states_to_model
++                and not self.speculative_config.uses_infill_bonus_token()
++            )
++            else 0
+         )
+         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
+ 
+@@ -499,6 +507,21 @@ class SpecDecodeBaseProposer:
+     def take_last_draft_probs(self) -> torch.Tensor | None:
+         return self._last_draft_probs
+ 
++    def _parallel_sample_draft(
++        self,
++        sample_hidden_states: torch.Tensor,
++        next_token_ids: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++    ) -> torch.Tensor:
++        draft_token_ids, draft_probs = self._sample_draft_tokens(
++            sample_hidden_states, sampling_metadata
++        )
++        if draft_probs is not None:
++            self._last_draft_probs = draft_probs.view(
++                -1, self.num_speculative_tokens, draft_probs.shape[-1]
++            ).contiguous()
++        return draft_token_ids.view(-1, self.num_speculative_tokens)
++
+     def propose(
+         self,
+         num_speculative_tokens,
+@@ -523,7 +546,11 @@ class SpecDecodeBaseProposer:
+         self._last_draft_probs = None
+         batch_size = common_attn_metadata.batch_size()
+ 
+-        if self.method in ("eagle3", "dflash"):
++        if self.method in (
++            "eagle3",
++            "dflash",
++            "mamba_attn_hybrid",
++        ):
+             model = self.model
+             if isinstance(model, BreakableCUDAGraphWrapper):
+                 model = model.unwrap()
+@@ -535,12 +562,16 @@ class SpecDecodeBaseProposer:
+                     DFlashQwen3ForCausalLM,
+                     Eagle3Qwen3ForCausalLM,
+                     DFlashLagunaForCausalLM,
++                    MambaAttnHybridQwen3ForCausalLM,
+                 ),
+             )
+             target_hidden_states = self.model.combine_hidden_states(
+                 target_hidden_states
+             )
+-            assert target_hidden_states.shape[-1] == self.hidden_size
++            assert (
++                target_hidden_states.shape[-1] == self.hidden_size
++                or self.method == "mamba_attn_hybrid"
++            )
+ 
+         num_tokens, token_indices_to_sample, common_attn_metadata = (
+             self.set_inputs_first_pass(
+@@ -617,14 +648,9 @@ class SpecDecodeBaseProposer:
+ 
+         # Early exit if there is only one draft token to be generated.
+         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+-            draft_token_ids, draft_probs = self._sample_draft_tokens(
+-                sample_hidden_states, sampling_metadata
++            return self._parallel_sample_draft(
++                sample_hidden_states, next_token_ids, sampling_metadata
+             )
+-            if draft_probs is not None:
+-                self._last_draft_probs = draft_probs.view(
+-                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+-                ).contiguous()
+-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+ 
+         if self.uses_mrope:
+             positions = self.mrope_positions[:, token_indices_to_sample]
+@@ -1012,7 +1038,12 @@ class SpecDecodeBaseProposer:
+             return "DeepSeekMTPModel" in (
+                 self.draft_model_config.hf_config.architectures or []
+             )
+-        return self.method not in ("mtp", "draft_model", "dflash")
++        return self.method not in (
++            "mtp",
++            "draft_model",
++            "dflash",
++            "mamba_attn_hybrid",
++        )
+ 
+     def prepare_next_token_ids_cpu(
+         self,
+@@ -1393,6 +1424,7 @@ class SpecDecodeBaseProposer:
+ 
+         self._maybe_share_embeddings(target_language_model)
+         self._maybe_share_lm_head(target_language_model)
++        self._maybe_share_kv_cache(target_language_model)
+ 
+         if (
+             self.parallel_drafting
+@@ -1498,6 +1530,45 @@ class SpecDecodeBaseProposer:
+                 " from the target model."
+             )
+ 
++    def _maybe_share_kv_cache(self, target_language_model: nn.Module) -> None:
++        if (
++            self.method != "mamba_attn_hybrid"
++            or not self.speculative_config.enable_kv_sharing
++        ):
++            return
++
++        draft_inner = getattr(self.model, "model", None)
++        if draft_inner is None or not hasattr(draft_inner, "layers"):
++            logger.warning(
++                "enable_kv_sharing is set but could not access "
++                "model.model.layers on draft. Skipping KV cache sharing."
++            )
++            return
++
++        target_num_layers = (
++            self.vllm_config.model_config.get_num_layers(
++                self.vllm_config.parallel_config
++            )
++        )
++
++        shared = 0
++        for draft_idx, layer in enumerate(draft_inner.layers):
++            if not hasattr(layer, "self_attn"):
++                continue
++            attn = getattr(layer.self_attn, "attn", None)
++            if attn is None:
++                continue
++            if draft_idx >= target_num_layers:
++                break
++            target_name = f"model.layers.{draft_idx}.self_attn.attn"
++            attn.kv_sharing_target_layer_name = target_name
++            shared += 1
++
++        logger.info(
++            "Shared KV cache for %d / %d draft layers with target model.",
++            shared, len(draft_inner.layers),
++        )
++
+     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
+         """
+         Some draft models may not have their own LM head, and some may have a
+diff --git a/vllm/v1/spec_decode/mamba_attn_hybrid.py b/vllm/v1/spec_decode/mamba_attn_hybrid.py
+new file mode 100644
+index 0000000..dcc41ca
+--- /dev/null
++++ b/vllm/v1/spec_decode/mamba_attn_hybrid.py
+@@ -0,0 +1,462 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++from dataclasses import replace
++from typing import Any, cast
++
++import torch
++from torch import nn
++from typing_extensions import override
++
++from vllm.config import VllmConfig
++from vllm.forward_context import set_forward_context
++from vllm.logger import init_logger
++from vllm.triton_utils import triton
++from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
++from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
++
++logger = init_logger(__name__)
++
++
++class MambaAttnHybridProposer(SpecDecodeBaseProposer):
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        device: torch.device,
++        runner=None,
++    ):
++        assert vllm_config.speculative_config is not None
++        assert vllm_config.speculative_config.method == "mamba_attn_hybrid"
++        super().__init__(
++            vllm_config=vllm_config,
++            device=device,
++            pass_hidden_states_to_model=True,
++            runner=runner,
++        )
++
++        self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
++        self.max_positions = self.max_num_tokens + self.max_query_tokens
++
++        self._context_slot_mapping_buffer = torch.zeros(
++            self.max_num_tokens,
++            dtype=torch.int64,
++            device=device,
++        )
++        self._slot_mapping_buffer = torch.zeros(
++            self.max_query_tokens,
++            dtype=torch.int64,
++            device=device,
++        )
++        self._context_positions_buffer = torch.zeros(
++            self.max_num_tokens,
++            dtype=torch.int64,
++            device=device,
++        )
++        self.positions = torch.zeros(
++            self.max_query_tokens,
++            dtype=torch.int64,
++            device=device,
++        )
++
++        self.arange = torch.arange(
++            self.max_positions + 1, device=device, dtype=torch.int32
++        )
++
++        self.parallel_drafting_hidden_state_tensor = None
++
++        self._draft_attn_layers: list | None = None
++        self._verifier_attns: list | None = None
++        self._kv_sharing_active: bool = False
++
++        self._latent_fusion_F: int | None = None
++        self._latent_seed_buffer: torch.Tensor | None = None
++
++    @override
++    def _create_draft_vllm_config(self) -> VllmConfig:
++        base = super()._create_draft_vllm_config()
++        return replace(
++            base,
++            attention_config=replace(
++                base.attention_config,
++                use_non_causal=True,
++            ),
++        )
++
++    @override
++    def _warn_if_multimodal(self):
++        pass
++
++    @override
++    def _parallel_sample_draft(
++        self,
++        sample_hidden_states: torch.Tensor,
++        next_token_ids: torch.Tensor,
++        sampling_metadata,
++    ) -> torch.Tensor:
++        if not self.model.has_markov_head:
++            return super()._parallel_sample_draft(
++                sample_hidden_states, next_token_ids, sampling_metadata
++            )
++        greedy = (
++            not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy
++        )
++        if not greedy:
++            raise NotImplementedError(
++                "DSpark (mamba_attn_hybrid + markov_rank>0) drafting supports only "
++                "greedy sampling; the reference's seeded-Gumbel probabilistic path "
++                "has no equivalent in this fork. Run with greedy sampling."
++            )
++        n_spec = self.num_speculative_tokens
++        num_reqs = next_token_ids.shape[0]
++        base_logits = self.model.compute_draft_logits(sample_hidden_states)
++        draft_vocab = base_logits.shape[-1]
++        base_logits = base_logits.view(num_reqs, n_spec, draft_vocab)
++
++        draft_tokens = torch.empty(
++            (num_reqs, n_spec), dtype=torch.int64, device=base_logits.device
++        )
++        prev = next_token_ids.to(torch.long)
++        for i in range(n_spec):
++            markov_embed = self.model.markov_embed(prev)
++            bias = self.model.markov_bias(markov_embed)
++            logits_i = base_logits[:, i] + bias
++            tok = self.model.map_draft_to_target(logits_i.argmax(dim=-1))
++            draft_tokens[:, i] = tok
++            prev = tok
++        return draft_tokens
++
++    @override
++    def load_model(self, target_model: nn.Module) -> None:
++        super().load_model(target_model)
++
++        from vllm.model_executor.models.interfaces import (
++            SupportsMultiModal,
++            supports_multimodal,
++        )
++
++        if supports_multimodal(target_model):
++            target_language_model = cast(
++                SupportsMultiModal, target_model
++            ).get_language_model()
++        else:
++            target_language_model = target_model
++
++        hf_config = self.draft_model_config.hf_config
++
++        assert getattr(hf_config, "layer_mapping", None) is None, (
++            "Mamba-Attn-Hybrid is identity-only; layer_mapping must be None."
++        )
++
++        self._draft_attn_layers = [
++            sub.self_attn.attn for sub in self.model.model.attn_sublayers
++        ]
++        num_attn_layers = len(self._draft_attn_layers)
++
++        verifier_kv_layer_ids = getattr(hf_config, "attn_kv_layer_ids", None)
++        assert verifier_kv_layer_ids is not None, (
++            "Checkpoint must have attn_kv_layer_ids in config (one verifier KV "
++            "layer per attention sub-layer, in attention-block order)."
++        )
++        assert len(verifier_kv_layer_ids) == num_attn_layers, (
++            f"attn_kv_layer_ids has {len(verifier_kv_layer_ids)} entries but the "
++            f"recipe has {num_attn_layers} attention sub-layer(s); they must match."
++        )
++
++        latent_fusion_layer_ids = getattr(
++            hf_config, "latent_fusion_layer_ids", None
++        )
++        if latent_fusion_layer_ids is None:
++            latent_fusion_layer_ids = getattr(
++                hf_config, "eagle_aux_hidden_state_layer_ids", None
++            )
++        assert latent_fusion_layer_ids is not None, (
++            "Checkpoint must have latent_fusion_layer_ids or "
++            "eagle_aux_hidden_state_layer_ids to size the latent seed."
++        )
++        self._latent_fusion_F = len(latent_fusion_layer_ids)
++
++        draft_hidden_size = hf_config.hidden_size
++        self._latent_seed_buffer = torch.zeros(
++            self.max_batch_size,
++            self._latent_fusion_F * draft_hidden_size,
++            dtype=self.dtype,
++            device=self.device,
++        )
++
++        assert self._latent_fusion_F == self.model.model.num_fusion_layers, (
++            f"latent fusion F mismatch: proposer={self._latent_fusion_F} "
++            f"model={self.model.model.num_fusion_layers}"
++        )
++
++        all_verifier_attns = [
++            layer.self_attn.attn for layer in target_language_model.model.layers
++        ]
++        n_verifier_layers = len(all_verifier_attns)
++        bad_kv = [
++            lid for lid in verifier_kv_layer_ids if not 0 <= lid < n_verifier_layers
++        ]
++        if bad_kv:
++            raise ValueError(
++                f"attn_kv_layer_ids {bad_kv} out of range for a verifier with "
++                f"{n_verifier_layers} layers (valid 0..{n_verifier_layers - 1}); "
++                "keep --attn-kv-layer-ids consistent with the verifier."
++            )
++        self._verifier_attns = [
++            all_verifier_attns[lid] for lid in verifier_kv_layer_ids
++        ]
++
++        if self.speculative_config.enable_kv_sharing:
++            for draft_attn, verifier_lid in zip(
++                self._draft_attn_layers, verifier_kv_layer_ids
++            ):
++                draft_attn.kv_sharing_target_layer_name = (
++                    f"model.layers.{verifier_lid}.self_attn.attn"
++                )
++            self._kv_sharing_active = True
++
++        logger.info(
++            "MambaAttnHybrid: %d attention sub-layers, verifier KV layers %s, "
++            "F=%d fusion layers %s, kv_sharing=%s",
++            num_attn_layers,
++            list(verifier_kv_layer_ids),
++            self._latent_fusion_F,
++            list(latent_fusion_layer_ids),
++            self._kv_sharing_active,
++        )
++
++    def _copy_verifier_kv_to_draft(
++        self,
++        context_slot_mapping: torch.Tensor,
++    ) -> None:
++        assert self._draft_attn_layers is not None
++        assert self._verifier_attns is not None
++        for draft_attn, verifier_attn in zip(
++            self._draft_attn_layers, self._verifier_attns
++        ):
++            if draft_attn.kv_sharing_target_layer_name is not None:
++                continue
++            verifier_kv = verifier_attn.kv_cache
++            cache_block_size = verifier_kv.shape[2]
++            block_ids = context_slot_mapping // cache_block_size
++            offsets = context_slot_mapping % cache_block_size
++            k = verifier_kv[0, block_ids, offsets]
++            v = verifier_kv[1, block_ids, offsets]
++            draft_attn.impl.do_kv_cache_update(
++                draft_attn, k, v, draft_attn.kv_cache, context_slot_mapping,
++            )
++
++    @override
++    def set_inputs_first_pass(
++        self,
++        target_token_ids: torch.Tensor,
++        next_token_ids: torch.Tensor,
++        target_positions: torch.Tensor,
++        target_hidden_states: torch.Tensor,
++        token_indices_to_sample: torch.Tensor | None,
++        cad: CommonAttentionMetadata,
++        num_rejected_tokens_gpu: torch.Tensor | None,
++    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
++        batch_size = cad.batch_size()
++        num_context = target_token_ids.shape[0]
++        num_query_per_req = 1 + self.num_speculative_tokens
++        num_query_total = batch_size * num_query_per_req
++
++        self._dflash_num_context = num_context
++
++        self._dflash_hidden_states = target_hidden_states
++
++        anchor_indices = cad.query_start_loc[1:] - 1
++        if num_rejected_tokens_gpu is not None:
++            anchor_indices = anchor_indices - num_rejected_tokens_gpu
++        self._dflash_anchor_indices = anchor_indices
++
++        token_indices_to_sample = torch.empty(
++            batch_size * self.num_speculative_tokens,
++            dtype=torch.int32,
++            device=self.device,
++        )
++
++        max_ctx_per_req = cad.max_query_len
++        max_tokens_per_req = max_ctx_per_req + num_query_per_req
++        BLOCK_SIZE = min(256, triton.next_power_of_2(max_tokens_per_req))
++        num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
++        grid = (batch_size, num_blocks)
++
++        has_num_rejected = num_rejected_tokens_gpu is not None
++        copy_and_expand_dflash_inputs_kernel[grid](
++            next_token_ids_ptr=next_token_ids,
++            target_positions_ptr=target_positions,
++            out_input_ids_ptr=self.input_ids,
++            out_context_positions_ptr=self._context_positions_buffer,
++            out_query_positions_ptr=self.positions,
++            out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
++            out_query_slot_mapping_ptr=self._slot_mapping_buffer,
++            out_token_indices_ptr=token_indices_to_sample,
++            block_table_ptr=cad.block_table_tensor,
++            block_table_stride=cad.block_table_tensor.stride(0),
++            query_start_loc_ptr=cad.query_start_loc,
++            num_rejected_tokens_ptr=(
++                num_rejected_tokens_gpu if has_num_rejected else 0
++            ),
++            parallel_drafting_token_id=self.parallel_drafting_token_id,
++            block_size=self.block_size,
++            num_query_per_req=num_query_per_req,
++            num_speculative_tokens=self.num_speculative_tokens,
++            total_input_tokens=num_context,
++            BLOCK_SIZE=BLOCK_SIZE,
++            HAS_NUM_REJECTED=has_num_rejected,
++        )
++
++        query_slot_mapping = self._slot_mapping_buffer[:num_query_total]
++        new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
++
++        effective_seq_lens = cad.seq_lens
++        if has_num_rejected:
++            effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
++
++        new_seq_lens_cpu_upper_bound = (
++            cad.seq_lens_cpu_upper_bound + num_query_per_req
++            if cad.seq_lens_cpu_upper_bound is not None
++            else None
++        )
++        new_cad = CommonAttentionMetadata(
++            query_start_loc=new_query_start_loc,
++            seq_lens=effective_seq_lens + num_query_per_req,
++            query_start_loc_cpu=(
++                torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
++                * num_query_per_req
++            ),
++            _seq_lens_cpu=None,
++            _num_computed_tokens_cpu=None,
++            seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
++            num_reqs=cad.num_reqs,
++            num_actual_tokens=num_query_total,
++            max_query_len=num_query_per_req,
++            max_seq_len=cad.max_seq_len + num_query_per_req,
++            block_table_tensor=cad.block_table_tensor,
++            slot_mapping=query_slot_mapping,
++            causal=False,
++        )
++
++        return num_query_total, token_indices_to_sample, new_cad
++
++    @override
++    @torch.inference_mode()
++    def dummy_run(
++        self,
++        num_tokens: int,
++        use_cudagraphs: bool = True,
++        is_graph_capturing: bool = False,
++        slot_mappings: dict[str, torch.Tensor] | None = None,
++    ) -> None:
++        num_query_tokens = min(num_tokens, self.max_query_tokens)
++        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++            self._determine_batch_execution_and_padding(
++                num_query_tokens, use_cudagraphs=use_cudagraphs
++            )
++        )
++
++        if (
++            self._draft_attn_layer_names
++            and slot_mappings is not None
++            and next(iter(self._draft_attn_layer_names)) in slot_mappings
++        ):
++            slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
++        else:
++            slot_mapping_dict = slot_mappings or {}
++
++
++        if self._latent_seed_buffer is not None:
++            self._latent_seed_buffer.zero_()
++
++        with set_forward_context(
++            None,
++            self.vllm_config,
++            num_tokens=num_input_tokens,
++            num_tokens_across_dp=num_tokens_across_dp,
++            cudagraph_runtime_mode=cudagraph_runtime_mode,
++            slot_mapping=slot_mapping_dict,
++        ):
++            self.model(
++                input_ids=self.input_ids[:num_input_tokens],
++                positions=self._get_positions(num_input_tokens),
++                inputs_embeds=None,
++                latent_seed=self._latent_seed_buffer,
++            )
++
++    @override
++    def build_model_inputs_first_pass(
++        self,
++        num_tokens: int,
++        num_input_tokens: int,
++        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
++    ) -> tuple[dict[str, Any], int]:
++
++        if not self._kv_sharing_active:
++            self._copy_verifier_kv_to_draft(
++                self._context_slot_mapping_buffer[: self._dflash_num_context],
++            )
++
++        assert self._latent_seed_buffer is not None
++        anchor_rows = self._dflash_hidden_states[self._dflash_anchor_indices]
++        num_reqs = anchor_rows.shape[0]
++        self._latent_seed_buffer[:num_reqs].copy_(anchor_rows)
++
++        return (
++            dict(
++                input_ids=self.input_ids[:num_input_tokens],
++                positions=self._get_positions(num_input_tokens),
++                inputs_embeds=None,
++                latent_seed=self._latent_seed_buffer,
++            ),
++            num_input_tokens,
++        )
++
++    @override
++    def build_per_group_and_layer_attn_metadata(
++        self, cad: CommonAttentionMetadata, draft_index: int = 0
++    ) -> tuple[list[object], dict[str, object]]:
++        per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
++            cad, draft_index
++        )
++
++        sliding_layer_names: set[str] = getattr(
++            self.model, "sliding_attention_layer_names", set()
++        )
++        if sliding_layer_names:
++            for attn_group in self.draft_attn_groups:
++                causal_layers = sliding_layer_names & set(attn_group.layer_names)
++                if causal_layers:
++                    causal_attn_metadata = (
++                        attn_group.get_metadata_builder().build_for_drafting(
++                            common_attn_metadata=cad.replace(causal=True),
++                            draft_index=draft_index,
++                        )
++                    )
++                    for layer_name in causal_layers:
++                        per_layer[layer_name] = causal_attn_metadata
++
++        for layer_name, attn_metadata in per_layer.items():
++            if layer_name in sliding_layer_names:
++                assert getattr(attn_metadata, "causal", None) is True, (
++                    f"Attention metadata for sliding layer {layer_name} does not have"
++                    " causal support, which is required for DFlash SWA."
++                )
++                continue
++            assert getattr(attn_metadata, "causal", None) is False, (
++                f"Attention metadata for layer {layer_name} is not non-causal,"
++                " which is required for Mamba-Attn-Hybrid full-attention layers."
++            )
++        return per_group, per_layer
++
++    @override
++    def _get_eagle3_use_aux_hidden_state_from_config(self):
++        use_aux_hidden_state = True
++        dflash_config = getattr(
++            self.draft_model_config.hf_config, "dflash_config", None
++        )
++        if dflash_config is not None:
++            use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
++        return use_aux_hidden_state
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c74307d..bbef537 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -193,7 +193,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+ 
+-            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
++            if self.speculative_config.method in (
++                "eagle3",
++                "dflash",
++                "dspark",
++                "mamba_attn_hybrid",
++            ):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+                 if self.use_pp:
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index c70f169..d039118 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -14,6 +14,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
+         )
+ 
+         return DFlashSpeculator(vllm_config, device)
++    elif speculative_config.method == "mamba_attn_hybrid":
++        from vllm.v1.worker.gpu.spec_decode.mamba_attn_hybrid.speculator import (
++            MambaAttnHybridSpeculator,
++        )
++
++        return MambaAttnHybridSpeculator(vllm_config, device)
+     elif speculative_config.method == "dspark":
+         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+             DSparkSpeculator,
+diff --git a/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/__init__.py b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/__init__.py
+new file mode 100644
+index 0000000..208f01a
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/speculator.py b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/speculator.py
+new file mode 100644
+index 0000000..b650a21
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/speculator.py
+@@ -0,0 +1,232 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from typing import Any
++
++import torch
++
++from vllm.config import VllmConfig
++from vllm.config.compilation import CUDAGraphMode
++from vllm.logger import init_logger
++from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.worker.gpu.block_table import BlockTables
++from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.model_states.interface import ModelState
++from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++from vllm.v1.worker.gpu.spec_decode.mamba_attn_hybrid.utils import (
++    load_mamba_attn_hybrid_model,
++    wire_zero_copy_kv,
++)
++
++logger = init_logger(__name__)
++
++
++class MambaAttnHybridSpeculator(DSparkSpeculator):
++    _speculator_name = "MambaAttnHybrid"
++
++    def __init__(self, vllm_config: VllmConfig, device: torch.device):
++        super().__init__(vllm_config, device)
++
++        hf_config = self.draft_model_config.hf_config
++
++        self.sample_from_anchor = False
++        self.num_query_per_req = 1 + self.num_speculative_steps
++        self._anchor_idx = (
++            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
++            * self.num_query_per_req
++        )
++
++        fusion_layer_ids = getattr(hf_config, "latent_fusion_layer_ids", None) or getattr(
++            hf_config, "eagle_aux_hidden_state_layer_ids", None
++        )
++        if not fusion_layer_ids:
++            raise ValueError(
++                "mamba_attn_hybrid needs latent_fusion_layer_ids (or "
++                "eagle_aux_hidden_state_layer_ids) to size the latent seed."
++            )
++        self.num_fusion_layers = len(fusion_layer_ids)
++        hidden = self.draft_model_config.get_hidden_size()
++
++        self.hidden_states = torch.zeros(
++            self.max_num_tokens,
++            self.num_fusion_layers * hidden,
++            dtype=self.dtype,
++            device=device,
++        )
++        self.latent_seed = torch.zeros(
++            self.max_num_reqs,
++            self.num_fusion_layers * hidden,
++            dtype=self.dtype,
++            device=device,
++        )
++
++    def load_draft_model(
++        self,
++        target_model: torch.nn.Module,
++        target_attn_layer_names: set[str],
++    ) -> torch.nn.Module:
++        model = load_mamba_attn_hybrid_model(target_model, self.vllm_config)
++        kv_ids = wire_zero_copy_kv(model, target_model)
++
++        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
++            d2t = model.draft_id_to_target_id
++            self._d2t_scatter_index = torch.arange(d2t.shape[0], device=d2t.device) + d2t
++            self._draft_scatter_buf = torch.full(
++                (self.max_num_reqs, self.vocab_size),
++                float("-inf"),
++                dtype=self.draft_logits.dtype,
++                device=self.device,
++            )
++            logger.info(
++                "MambaAttnHybrid: reduced draft vocab (%d -> %d); probabilistic "
++                "scatter map built",
++                d2t.shape[0],
++                self.vocab_size,
++            )
++
++        logger.info(
++            "MambaAttnHybrid: %d attention sub-layers <- verifier KV %s, F=%d "
++            "fusion layers, zero-copy KV sharing enabled, draft sampling=%s",
++            len(kv_ids),
++            kv_ids,
++            self.num_fusion_layers,
++            "sequential Markov"
++            if getattr(model, "has_markov_head", False)
++            else "parallel",
++        )
++        return model
++
++    def set_attn(
++        self,
++        model_state: ModelState,
++        kv_cache_config: KVCacheConfig,
++        block_tables: BlockTables,
++    ) -> None:
++        super().set_attn(model_state, kv_cache_config, block_tables)
++        sliding = getattr(self.model, "sliding_attention_layer_names", set())
++        if sliding and len(sliding) != len(self.model.model.attn_sublayers):
++            raise NotImplementedError(
++                "V2 builds one attention metadata for the whole draft, so a "
++                "recipe mixing sliding and full attention is not supported yet "
++                f"({len(sliding)} of {len(self.model.model.attn_sublayers)} "
++                "sub-layers are sliding). Train with --sliding-window-indices "
++                "covering all attention blocks, or none."
++            )
++        self.dflash_causal = bool(sliding)
++
++    def capture(self, attn_states: dict | None = None) -> None:
++        self.latent_seed.zero_()
++        assert self.query_cudagraph_manager is not None
++        self.query_cudagraph_manager.causal = self.dflash_causal
++        super().capture(attn_states)
++
++    @torch.inference_mode()
++    def _run_model(
++        self,
++        num_tokens: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> torch.Tensor:
++        from vllm.forward_context import BatchDescriptor, set_forward_context
++
++        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
++        with set_forward_context(
++            attn_metadata,
++            self.vllm_config,
++            num_tokens=num_tokens,
++            cudagraph_runtime_mode=cudagraph_runtime_mode,
++            num_tokens_across_dp=num_tokens_across_dp,
++            slot_mapping=slot_mappings,
++            batch_descriptor=batch_descriptor,
++        ):
++            return self.model(
++                input_ids=self.input_buffers.input_ids[:num_tokens],
++                positions=self.input_buffers.positions[:num_tokens],
++                inputs_embeds=None,
++                latent_seed=self.latent_seed,
++            )
++
++    def _generate_draft(
++        self,
++        num_reqs: int,
++        num_tokens_padded: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> None:
++        if getattr(self.model, "has_markov_head", False):
++            super()._generate_draft(
++                num_reqs,
++                num_tokens_padded,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp,
++                cudagraph_runtime_mode,
++            )
++        else:
++            DFlashSpeculator._generate_draft(
++                self,
++                num_reqs,
++                num_tokens_padded,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp,
++                cudagraph_runtime_mode,
++            )
++
++    @torch.inference_mode()
++    def propose(
++        self,
++        input_batch: InputBatch,
++        attn_metadata: dict[str, Any],
++        slot_mappings: dict[str, torch.Tensor],
++        last_hidden_states: torch.Tensor,
++        aux_hidden_states: list[torch.Tensor] | None,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++        last_sampled: torch.Tensor,
++        next_prefill_tokens: torch.Tensor,
++        temperature: torch.Tensor,
++        seeds: torch.Tensor,
++        num_tokens_across_dp: torch.Tensor | None = None,
++        dummy_run: bool = False,
++        skip_attn_for_dummy_run: bool = False,
++        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        is_profile: bool = False,
++    ) -> torch.Tensor:
++        if aux_hidden_states:
++            num_reqs = input_batch.num_reqs
++            fused = torch.cat(aux_hidden_states, dim=-1)
++            anchor = (
++                input_batch.query_start_loc[1 : num_reqs + 1]
++                - 1
++                - num_rejected[:num_reqs]
++            )
++            self.latent_seed[:num_reqs].copy_(fused[anchor])
++        else:
++            last_hidden_states = last_hidden_states.new_zeros(
++                last_hidden_states.shape[0], self.hidden_states.shape[1]
++            )
++
++        return super().propose(
++            input_batch,
++            attn_metadata,
++            slot_mappings,
++            last_hidden_states,
++            aux_hidden_states,
++            num_sampled,
++            num_rejected,
++            last_sampled,
++            next_prefill_tokens,
++            temperature,
++            seeds,
++            num_tokens_across_dp=num_tokens_across_dp,
++            dummy_run=dummy_run,
++            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
++            mm_inputs=mm_inputs,
++            is_profile=is_profile,
++        )
+diff --git a/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/utils.py b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/utils.py
+new file mode 100644
+index 0000000..f264ede
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/mamba_attn_hybrid/utils.py
+@@ -0,0 +1,99 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch.nn as nn
++
++from vllm.config import VllmConfig, replace
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader import get_model
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
++
++logger = init_logger(__name__)
++
++
++def load_mamba_attn_hybrid_model(
++    target_model: nn.Module, vllm_config: VllmConfig
++) -> nn.Module:
++    from vllm.compilation.backends import set_model_tag
++
++    speculative_config = vllm_config.speculative_config
++    assert speculative_config is not None
++    draft_model_config = speculative_config.draft_model_config
++
++    draft_vllm_config = replace(
++        vllm_config,
++        attention_config=replace(
++            vllm_config.attention_config,
++            use_non_causal=True,
++            backend=speculative_config.attention_backend,
++        ),
++    )
++
++    with set_model_tag("mamba_attn_hybrid_head"):
++        draft_model = get_model(
++            vllm_config=draft_vllm_config, model_config=draft_model_config
++        )
++
++    if get_pp_group().world_size != 1:
++        raise NotImplementedError(
++            "mamba_attn_hybrid does not support pipeline parallelism."
++        )
++
++    target_language_model = (
++        target_model.get_language_model()
++        if hasattr(target_model, "get_language_model")
++        else target_model
++    )
++    target_inner = target_language_model.model
++    draft_inner = draft_model.model
++
++    target_embed = getattr(target_inner, "embed_tokens", None)
++    draft_embed = getattr(draft_inner, "embed_tokens", None)
++    if target_embed is not None and _should_share(
++        draft_model, "has_own_embed_tokens", draft_embed, target_embed
++    ):
++        if draft_embed is not None:
++            del draft_inner.embed_tokens
++        draft_inner.embed_tokens = target_embed
++
++    target_lm_head = getattr(target_model, "lm_head", None)
++    draft_lm_head = getattr(draft_model, "lm_head", None)
++    if target_lm_head is not None and _should_share(
++        draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
++    ):
++        if draft_lm_head is not None:
++            del draft_model.lm_head
++        draft_model.lm_head = target_lm_head
++
++    return draft_model
++
++
++def wire_zero_copy_kv(draft_model: nn.Module, target_model: nn.Module) -> list[int]:
++    hf_config = draft_model.config
++    attn_kv_layer_ids = list(getattr(hf_config, "attn_kv_layer_ids", None) or [])
++    attn_sublayers = draft_model.model.attn_sublayers
++    if len(attn_kv_layer_ids) != len(attn_sublayers):
++        raise ValueError(
++            f"attn_kv_layer_ids has {len(attn_kv_layer_ids)} entries but the recipe "
++            f"has {len(attn_sublayers)} attention sub-layer(s); they must match."
++        )
++
++    target_language_model = (
++        target_model.get_language_model()
++        if hasattr(target_model, "get_language_model")
++        else target_model
++    )
++    n_verifier_layers = len(target_language_model.model.layers)
++    bad = [i for i in attn_kv_layer_ids if not 0 <= i < n_verifier_layers]
++    if bad:
++        raise ValueError(
++            f"attn_kv_layer_ids {bad} out of range for a verifier with "
++            f"{n_verifier_layers} layers (valid 0..{n_verifier_layers - 1})."
++        )
++
++    for sub, verifier_lid in zip(attn_sublayers, attn_kv_layer_ids):
++        sub.self_attn.attn.kv_sharing_target_layer_name = (
++            f"model.layers.{verifier_lid}.self_attn.attn"
++        )
++    return attn_kv_layer_ids
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e9b23f1..c9938c5 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -182,6 +182,9 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
+ from vllm.v1.sample.sampler import Sampler
+ from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+ from vllm.v1.spec_decode.dflash import DFlashProposer
++from vllm.v1.spec_decode.mamba_attn_hybrid import (
++    MambaAttnHybridProposer,
++)
+ from vllm.v1.spec_decode.draft_model import DraftModelProposer
+ from vllm.v1.spec_decode.eagle import EagleProposer
+ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+@@ -574,6 +577,7 @@ class GPUModelRunner(
+                 | SuffixDecodingProposer
+                 | EagleProposer
+                 | DFlashProposer
++                | MambaAttnHybridProposer
+                 | DraftModelProposer
+                 | MedusaProposer
+                 | ExtractHiddenStatesProposer
+@@ -618,6 +622,11 @@ class GPUModelRunner(
+             elif self.speculative_config.use_dflash():
+                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                 self.use_aux_hidden_state_outputs = True
++            elif self.speculative_config.use_mamba_attn_hybrid():
++                self.drafter = MambaAttnHybridProposer(
++                    self.vllm_config, self.device, self
++                )
++                self.use_aux_hidden_state_outputs = True
+             elif self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+             elif self.speculative_config.use_eagle():
+@@ -2526,6 +2535,7 @@ class GPUModelRunner(
+                     (
+                         EagleProposer,
+                         DFlashProposer,
++                        MambaAttnHybridProposer,
+                         Gemma4Proposer,
+                         ExtractHiddenStatesProposer,
+                     ),
+@@ -4445,7 +4455,7 @@ class GPUModelRunner(
+         assert self.speculative_config is not None
+         # DFlash queries one extra token (the bonus token) beyond num_spec_tokens
+         num_drafter_query_tokens = self.num_spec_tokens + (
+-            1 if self.speculative_config.use_dflash() else 0
++            1 if self.speculative_config.uses_infill_bonus_token() else 0
+         )
+         return (
+             common_attn_metadata.max_seq_len + num_drafter_query_tokens
+@@ -4552,6 +4562,7 @@ class GPUModelRunner(
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
++                    | MambaAttnHybridProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+                     | Gemma4Proposer,
+@@ -4647,6 +4658,7 @@ class GPUModelRunner(
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
++                    | MambaAttnHybridProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+                     | Gemma4Proposer,
+@@ -5060,7 +5072,11 @@ class GPUModelRunner(
+         ):
+             assert isinstance(
+                 self.drafter,
+-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
++                EagleProposer
++                | DFlashProposer
++                | MambaAttnHybridProposer
++                | DraftModelProposer
++                | Gemma4Proposer,
+             )
+ 
+             if spec_config.disable_padded_drafter_batch:
+@@ -6029,6 +6045,7 @@ class GPUModelRunner(
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
++                    | MambaAttnHybridProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+                     | Gemma4Proposer,
+@@ -6933,7 +6950,11 @@ class GPUModelRunner(
+         ):
+             assert isinstance(
+                 self.drafter,
+-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
++                EagleProposer
++                | DFlashProposer
++                | MambaAttnHybridProposer
++                | DraftModelProposer
++                | Gemma4Proposer,
+             )
+             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+ 
+@@ -6989,6 +7010,7 @@ class GPUModelRunner(
+                 self.drafter,
+                 EagleProposer
+                 | DFlashProposer
++                | MambaAttnHybridProposer
+                 | ExtractHiddenStatesProposer
+                 | Gemma4Proposer,
+             )
