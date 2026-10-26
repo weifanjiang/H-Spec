@@ -1,10 +1,13 @@
 # H-Spec: Parallel Speculative Decoding Without a Drafter-Side KV Cache
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2609.24197"><img src="https://img.shields.io/badge/arXiv-2609.24197-b31b1b.svg?logo=arxiv" alt="arXiv"></a>
+  <a href="https://huggingface.co/collections/weifanjiang/h-spec-6abac1b6b1e283d9e3cb0522"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fweifanjiang%2FH-Spec%2Fbadges%2Fhf-downloads.json" alt="Hugging Face downloads"></a>
+</p>
+
 Code implementation for H-Spec, a parallel speculative drafter that operates without storing a separate drafter-side KV cache in GPU memory. H-Spec uses two complementary sources of target-model information: the hidden states only at the last input position, and existing target KV caches.
 
 ![H-Spec overview.](figures/hspec-overview.png)
-
-[Link to arXiv preprint](https://arxiv.org/abs/2609.24197)
 
 ## Usage
 
